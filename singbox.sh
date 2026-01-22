@@ -2647,9 +2647,14 @@ _view_nodes() {
         # [!] 已修改：创建一个显示名称，优先使用clash.yaml中的名称，失败则回退到tag
         local display_name=${proxy_name_to_find:-$tag}
 
-        # 优先使用 metadata.json 中的 IP (用于 REALITY 和 TCP)
-        local display_server=$(_get_proxy_field "$proxy_name_to_find" ".server")
-        # 移除方括号
+        # [!] 修复：增加 IP 获取的回退机制
+        local display_server=$(_get_proxy_field "$proxy_name_to_find" ".server" | tr -d '"' | tr -d "'")
+        # 如果从 YAML 获取失败，则回退到当前检测到的服务器公网 IP
+        if [[ -z "$display_server" || "$display_server" == "null" ]]; then
+            display_server="$server_ip"
+        fi
+        
+        # 移除方括号 (处理 IPv6)
         local display_ip=$(echo "$display_server" | tr -d '[]')
         # IPv6链接格式：添加[]
         local link_ip="$display_ip"; [[ "$display_ip" == *":"* ]] && link_ip="[$display_ip]"
@@ -2714,7 +2719,10 @@ _view_nodes() {
                 ;;
             "hysteria2")
                 local pw=$(echo "$node" | jq -r '.users[0].password');
-                local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
+                local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni" | tr -d '"' | tr -d "'")
+                # 如果从 YAML 获取 SNI 失败，回退到当前 IP
+                [[ -z "$sn" || "$sn" == "null" ]] && sn="$display_ip"
+                
                 local meta=$(jq -r --arg t "$tag" '.[$t]' "$METADATA_FILE");
                 local op=$(echo "$meta" | jq -r '.obfsPassword')
                 local obfs_param=""; [[ -n "$op" && "$op" != "null" ]] && obfs_param="&obfs=salamander&obfs-password=${op}"
