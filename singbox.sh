@@ -646,9 +646,9 @@ _add_argo_vless_ws() {
     fi
     jq ". + $argo_meta" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
     
-    # [!] 重要修复：同步保存到主 metadata.json，以便主菜单(_view_nodes)能识别 Argo 节点并显示 443 端口
-    local main_meta=$(jq -n --arg is_argo "true" --arg ad "$tunnel_domain" \
-        '{ isArgo: $is_argo, argoDomain: $ad }')
+    # [!] 重要修复：同步保存到主 metadata.json，以便主菜单(_view_nodes)能识别 Argo 节点
+    local main_meta=$(jq -n --arg is_argo "true" --arg ad "$tunnel_domain" --arg pa "$preferred_address" --arg n "$name" \
+        '{ isArgo: $is_argo, argoDomain: $ad, preferredAddress: $pa, name: $n }')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $main_meta}" || return 1
     
     # 这里我们只记录了元数据，不一定要生成本地Clash配置，因为本地没开端口给Clash连
@@ -847,8 +847,8 @@ _add_argo_trojan_ws() {
     jq ". + $argo_meta" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
     
     # [!] 重要修复：同步保存到主 metadata.json
-    local main_meta=$(jq -n --arg is_argo "true" --arg ad "$tunnel_domain" \
-        '{ isArgo: $is_argo, argoDomain: $ad }')
+    local main_meta=$(jq -n --arg is_argo "true" --arg ad "$tunnel_domain" --arg pa "$preferred_address" --arg n "$name" \
+        '{ isArgo: $is_argo, argoDomain: $ad, preferredAddress: $pa, name: $n }')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $main_meta}" || return 1
     
     local connect_address="${preferred_address:-$tunnel_domain}"
@@ -939,33 +939,43 @@ _view_argo_nodes() {
     echo "==================================================="
     
     # 直接使用 jq 格式化输出，避免管道子 shell 问题
-    jq -r 'to_entries[] | "节点: \(.value.name)\n  协议: \(.value.protocol)\n  本地端口: \(.value.local_port)\n  保存的域名: \(.value.domain)\n  创建时间: \(.value.created_at)\n-------------------------------------------"' "$ARGO_METADATA_FILE"
+    # 直接使用 jq 格式化输出
+    jq -r 'to_entries[] | "节点: \(.value.name)\n  协议: \(.value.protocol)\n  本地端口: \(.value.local_port)\n  保存的域名: \(.value.domain)\n  优选地址: \(.value.preferred_address // "未设置")\n  创建时间: \(.value.created_at)\n-------------------------------------------"' "$ARGO_METADATA_FILE"
     
     echo "==================================================="
     
-    # 如果隧道正在运行，显示当前分享链接
-    if [ -n "$running_domain" ]; then
-        echo ""
-        _info "--- 当前可用的分享链接 ---"
+    # 显示所有 Argo 节点的分享链接
+    echo ""
+    _info "--- 当前可用的分享链接 ---"
+    
+    jq -c 'to_entries[]' "$ARGO_METADATA_FILE" | while read -r item; do
+        local protocol=$(echo "$item" | jq -r '.value.protocol')
+        local path=$(echo "$item" | jq -r '.value.path')
+        local name=$(echo "$item" | jq -r '.value.name')
+        local pa=$(echo "$item" | jq -r '.value.preferred_address // empty')
+        local tunnel_domain_saved=$(echo "$item" | jq -r '.value.domain')
         
-        local first_node=$(jq -r 'to_entries[0]' "$ARGO_METADATA_FILE")
-        local protocol=$(echo "$first_node" | jq -r '.value.protocol')
-        local path=$(echo "$first_node" | jq -r '.value.path')
-        local name=$(echo "$first_node" | jq -r '.value.name')
+        # 优先使用实时获取的域名，如果是 TryCloudflare 模式
+        local active_domain="${running_domain:-$tunnel_domain_saved}"
+        # 最终连接地址：优先优选，次之活动隧道域名
+        local connect_addr="${pa:-$active_domain}"
         
         if [ "$protocol" == "vless-ws" ]; then
-            local uuid=$(echo "$first_node" | jq -r '.value.uuid')
+            local uuid=$(echo "$item" | jq -r '.value.uuid')
             local encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
             local encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
-            echo -e "${YELLOW}vless://${uuid}@${running_domain}:443?encryption=none&security=tls&type=ws&host=${running_domain}&path=${encoded_path}&sni=${running_domain}#${encoded_name}${NC}"
+            echo -e "节点: ${GREEN}${name}${NC}"
+            echo -e "${YELLOW}vless://${uuid}@${connect_addr}:443?encryption=none&security=tls&type=ws&host=${active_domain}&path=${encoded_path}&sni=${active_domain}#${encoded_name}${NC}"
         elif [ "$protocol" == "trojan-ws" ]; then
-            local password=$(echo "$first_node" | jq -r '.value.password')
+            local password=$(echo "$item" | jq -r '.value.password')
             local encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
             local encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
             local encoded_password=$(printf '%s' "$password" | jq -sRr @uri)
-            echo -e "${YELLOW}trojan://${encoded_password}@${running_domain}:443?security=tls&type=ws&host=${running_domain}&path=${encoded_path}&sni=${running_domain}#${encoded_name}${NC}"
+            echo -e "节点: ${GREEN}${name}${NC}"
+            echo -e "${YELLOW}trojan://${encoded_password}@${connect_addr}:443?security=tls&type=ws&host=${active_domain}&path=${encoded_path}&sni=${active_domain}#${encoded_name}${NC}"
         fi
-    fi
+        echo "-------------------------------------------"
+    done
 }
 
 _delete_argo_node() {
@@ -2393,9 +2403,9 @@ _add_hysteria2() {
                         _warning "iptables 不可用，且端口范围过大，端口跳跃配置跳过。"
                         port_hopping=""
                     else
-                        # 配置 iptables 规则
+                        # 配置 iptables 规则 (使用 REDIRECT 代替 DNAT，避免 route_localnet 问题)
                         _info "正在配置端口跳跃 iptables 规则..."
-                        iptables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j DNAT --to-destination 127.0.0.1:${port}
+                        iptables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j REDIRECT --to-ports ${port}
                         if [ $? -eq 0 ]; then
                             _success "iptables 规则已添加"
                             # 保存规则（智能检测系统类型）
@@ -2626,30 +2636,46 @@ _view_nodes() {
         # 过滤掉多端口监听生成的辅助节点（跳过 tag 中包含 -hop- 的节点）
         if [[ "$tag" == *"-hop-"* ]]; then continue; fi
         
-        # 优化查找逻辑：优先使用端口匹配，因为tag和name可能不完全对应
+        # [!] 优化查找逻辑：Argo 节点直接从 metadata 获取名称，普通节点从 clash.yaml 获取
+        local is_argo=$(jq -r --arg t "$tag" '.[$t].isArgo // false' "$METADATA_FILE")
         local proxy_name_to_find=""
-        local proxy_obj_by_port=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} | head -n 1)
-
-        if [ -n "$proxy_obj_by_port" ]; then
-             proxy_name_to_find=$(echo "$proxy_obj_by_port" | ${YQ_BINARY} eval '.name' -)
-        fi
-
-        # 如果通过端口找不到（比如443端口被复用），则尝试用类型模糊匹配
-        if [[ -z "$proxy_name_to_find" ]]; then
-            proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | grep -i "${type}" | head -n 1)
+        
+        if [ "$is_argo" == "true" ]; then
+            proxy_name_to_find=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE")
         fi
         
-        # 再次降级，如果还找不到
-        if [[ -z "$proxy_name_to_find" ]]; then
-             proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | head -n 1)
+        if [ -z "$proxy_name_to_find" ]; then
+            local proxy_obj_by_port=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} | head -n 1)
+            if [ -n "$proxy_obj_by_port" ]; then
+                 proxy_name_to_find=$(echo "$proxy_obj_by_port" | ${YQ_BINARY} eval '.name' -)
+            fi
+            
+            # 如果通过端口找不到（比如443端口被复用），则尝试用类型模糊匹配
+            if [[ -z "$proxy_name_to_find" ]]; then
+                proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | grep -i "${type}" | head -n 1)
+            fi
+            
+            # 再次降级，如果还找不到
+            if [[ -z "$proxy_name_to_find" ]]; then
+                 proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | head -n 1)
+            fi
         fi
 
-        # [!] 已修改：创建一个显示名称，优先使用clash.yaml中的名称，失败则回退到tag
+        # [!] 已修改：创建一个显示名称，优先使用获取到的名称，失败则回退到tag
         local display_name=${proxy_name_to_find:-$tag}
 
         # [!] 修复：增加 IP 获取的回退机制
         local display_server=$(_get_proxy_field "$proxy_name_to_find" ".server" | tr -d '"' | tr -d "'")
-        # 如果从 YAML 获取失败，则回退到当前检测到的服务器公网 IP
+        
+        # 对于 Argo 节点，服务器地址可能是优选地址
+        if [ "$is_argo" == "true" ]; then
+            local pa=$(jq -r --arg t "$tag" '.[$t].preferredAddress // empty' "$METADATA_FILE")
+            if [ -n "$pa" ] && [ "$pa" != "null" ]; then
+                display_server="$pa"
+            fi
+        fi
+        
+        # 如果获取失败，则回退到当前检测到的服务器公网 IP
         if [[ -z "$display_server" || "$display_server" == "null" ]]; then
             display_server="$server_ip"
         fi
@@ -2683,11 +2709,10 @@ _view_nodes() {
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
                     
                     # [!] 处理 Argo 节点
-                    local is_argo=$(jq -r --arg t "$tag" '.[$t].isArgo // false' "$METADATA_FILE")
                     if [ "$is_argo" == "true" ]; then
                         local argo_domain=$(jq -r --arg t "$tag" '.[$t].argoDomain' "$METADATA_FILE")
                         if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
-                            url="vless://${uuid}@${argo_domain}:443?security=tls&encryption=none&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
+                             url="vless://${uuid}@${display_server}:443?security=tls&encryption=none&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
                         fi
                     fi
                 else
@@ -2705,11 +2730,10 @@ _view_nodes() {
                     url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
                     
                     # [!] 处理 Argo 节点
-                    local is_argo=$(jq -r --arg t "$tag" '.[$t].isArgo // false' "$METADATA_FILE")
                     if [ "$is_argo" == "true" ]; then
                         local argo_domain=$(jq -r --arg t "$tag" '.[$t].argoDomain' "$METADATA_FILE")
                         if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
-                            url="trojan://${password}@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
+                            url="trojan://${password}@${display_server}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
                         fi
                     fi
                 else
@@ -2808,16 +2832,24 @@ _delete_node() {
         inbound_types+=("$type")
 
         # --- 复用 _view_nodes 中的名称查找逻辑 ---
+        local is_argo=$(jq -r --arg t "$tag" '.[$t].isArgo // false' "$METADATA_FILE")
         local proxy_name_to_find=""
-        local proxy_obj_by_port=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} | head -n 1)
-        if [ -n "$proxy_obj_by_port" ]; then
-             proxy_name_to_find=$(echo "$proxy_obj_by_port" | ${YQ_BINARY} eval '.name' -)
+
+        if [ "$is_argo" == "true" ]; then
+            proxy_name_to_find=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE")
         fi
-        if [[ -z "$proxy_name_to_find" ]]; then
-            proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | grep -i "${type}" | head -n 1)
-        fi
-        if [[ -z "$proxy_name_to_find" ]]; then
-             proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | head -n 1)
+
+        if [ -z "$proxy_name_to_find" ]; then
+            local proxy_obj_by_port=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} | head -n 1)
+            if [ -n "$proxy_obj_by_port" ]; then
+                 proxy_name_to_find=$(echo "$proxy_obj_by_port" | ${YQ_BINARY} eval '.name' -)
+            fi
+            if [[ -z "$proxy_name_to_find" ]]; then
+                proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | grep -i "${type}" | head -n 1)
+            fi
+            if [[ -z "$proxy_name_to_find" ]]; then
+                 proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | head -n 1)
+            fi
         fi
         # --- 结束名称查找逻辑 ---
         
@@ -2884,17 +2916,24 @@ _delete_node() {
 
     # --- [!] 新的删除逻辑 ---
     # 我们需要再次运行查找逻辑，来确定 clash.yaml 中的确切名称
-    # (这一步是必须的，因为 display_names 可能会回退到 tag，但 clash.yaml 中是有自定义名称的)
+    local is_argo_del=$(jq -r --arg t "$tag_to_del" '.[$t].isArgo // false' "$METADATA_FILE")
     local proxy_name_to_del=""
-    local proxy_obj_by_port_del=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port_to_del}')' ${CLASH_YAML_FILE} | head -n 1)
-    if [ -n "$proxy_obj_by_port_del" ]; then
-         proxy_name_to_del=$(echo "$proxy_obj_by_port_del" | ${YQ_BINARY} eval '.name' -)
+
+    if [ "$is_argo_del" == "true" ]; then
+        proxy_name_to_del=$(jq -r --arg t "$tag_to_del" '.[$t].name // empty' "$METADATA_FILE")
     fi
-    if [[ -z "$proxy_name_to_del" ]]; then
-        proxy_name_to_del=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port_to_del}' or .port == 443) | .name' ${CLASH_YAML_FILE} | grep -i "${type_to_del}" | head -n 1)
-    fi
-    if [[ -z "$proxy_name_to_del" ]]; then
-         proxy_name_to_del=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port_to_del}' or .port == 443) | .name' ${CLASH_YAML_FILE} | head -n 1)
+
+    if [ -z "$proxy_name_to_del" ]; then
+        local proxy_obj_by_port_del=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port_to_del}')' ${CLASH_YAML_FILE} | head -n 1)
+        if [ -n "$proxy_obj_by_port_del" ]; then
+             proxy_name_to_del=$(echo "$proxy_obj_by_port_del" | ${YQ_BINARY} eval '.name' -)
+        fi
+        if [[ -z "$proxy_name_to_del" ]]; then
+            proxy_name_to_del=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port_to_del}' or .port == 443) | .name' ${CLASH_YAML_FILE} | grep -i "${type_to_del}" | head -n 1)
+        fi
+        if [[ -z "$proxy_name_to_del" ]]; then
+             proxy_name_to_del=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port_to_del}' or .port == 443) | .name' ${CLASH_YAML_FILE} | head -n 1)
+        fi
     fi
 
     # [!] 已修改：使用显示名称进行确认
