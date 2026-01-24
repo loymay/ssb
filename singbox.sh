@@ -213,40 +213,28 @@ _save_iptables_rules() {
     _info "正在保存 iptables 规则..."
     
     if [ "$INIT_SYSTEM" == "openrc" ]; then
-        # Alpine Linux: 使用 iptables 服务
-        local rules_file="/etc/iptables/rules-save"
+        # Alpine Linux
         mkdir -p /etc/iptables 2>/dev/null
-        iptables-save > "$rules_file" 2>/dev/null
+        iptables-save > "/etc/iptables/rules-save" 2>/dev/null
+        [ -x "$(command -v ip6tables-save)" ] && ip6tables-save > "/etc/iptables/rules6-save" 2>/dev/null
         
-        # 启用 iptables 服务自动启动
         if command -v rc-update &>/dev/null; then
             rc-update add iptables default 2>/dev/null
-            _success "iptables 规则已保存，重启后自动恢复"
-        else
-            _warning "请手动配置 iptables 开机自启"
+            rc-update add ip6tables default 2>/dev/null
+            _success "iptables/ip6tables 规则已保存，重启后自动恢复"
         fi
     else
-        # Debian/Ubuntu: 使用 iptables-persistent 或直接保存
-        local rules_file="/etc/iptables/rules.v4"
+        # Debian/Ubuntu
         mkdir -p /etc/iptables 2>/dev/null
-        iptables-save > "$rules_file" 2>/dev/null
+        iptables-save > "/etc/iptables/rules.v4" 2>/dev/null
+        [ -x "$(command -v ip6tables-save)" ] && ip6tables-save > "/etc/iptables/rules.v6" 2>/dev/null
         
-        # 检查是否安装了 iptables-persistent
         if dpkg -l | grep -q iptables-persistent 2>/dev/null; then
             _success "iptables 规则已保存，重启后自动恢复"
         else
-            # 尝试安装 iptables-persistent（静默安装）
             if command -v apt-get &>/dev/null; then
                 DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
-                if [ $? -eq 0 ]; then
-                    _success "iptables-persistent 已安装，规则将在重启后自动恢复"
-                else
-                    _warning "规则已保存到 ${rules_file}，但需手动加载"
-                    _info "开机加载命令: iptables-restore < ${rules_file}"
-                fi
-            else
-                _warning "规则已保存到 ${rules_file}，但需手动加载"
-                _info "开机加载命令: iptables-restore < ${rules_file}"
+                [ $? -eq 0 ] && _success "iptables-persistent 已安装，规则将自动恢复" || _warning "规则已保存，但建议安装 iptables-persistent"
             fi
         fi
     fi
@@ -254,26 +242,17 @@ _save_iptables_rules() {
 
 # 确保 iptables 已安装
 _ensure_iptables() {
-    if ! command -v iptables &>/dev/null; then
-        _info "未检测到 iptables，尝试安装..."
-        if command -v apk &>/dev/null; then
-            apk add --no-cache iptables
-        elif command -v apt-get &>/dev/null; then
-            apt-get update && apt-get install -y iptables
-        elif command -v yum &>/dev/null; then
-            yum install -y iptables
-        elif command -v dnf &>/dev/null; then
-            dnf install -y iptables
-        else
-            _error "无法自动安装 iptables，请手动安装后重试。"
-            return 1
+    local pkgs=""
+    ! command -v iptables &>/dev/null && pkgs+=" iptables"
+    ! command -v ip6tables &>/dev/null && pkgs+=" ip6tables"
+    
+    if [ -n "$pkgs" ]; then
+        _info "正在安装缺失的网关工具:${pkgs}..."
+        if command -v apk &>/dev/null; then apk add --no-cache $pkgs
+        elif command -v apt-get &>/dev/null; then apt-get update && apt-get install -y $pkgs
+        elif command -v yum &>/dev/null; then yum install -y $pkgs
+        elif command -v dnf &>/dev/null; then dnf install -y $pkgs
         fi
-        
-        if ! command -v iptables &>/dev/null; then
-             _error "iptables 安装失败。"
-             return 1
-        fi
-        _success "iptables 安装成功。"
     fi
     return 0
 }
@@ -1408,8 +1387,8 @@ _uninstall() {
         rc-update del sing-box default >/dev/null 2>&1
     fi
     
-    _info "正在删除主配置、yq、日志文件及进阶脚本..."
-    rm -rf ${SINGBOX_DIR} ${YQ_BINARY} ${SERVICE_FILE} ${LOG_FILE} ${PID_FILE} "/root/advanced_relay.sh" "./advanced_relay.sh"
+    _info "正在删除主配置、yq、日志文件..."
+    rm -rf ${SINGBOX_DIR} ${YQ_BINARY} ${SERVICE_FILE} ${LOG_FILE} ${PID_FILE}
     
     # 清理中转路由辅助文件目录
     if [ -d "/etc/singbox" ]; then
@@ -2404,16 +2383,13 @@ _add_hysteria2() {
                         port_hopping=""
                     else
                         # 配置 iptables 规则 (使用 REDIRECT 代替 DNAT，避免 route_localnet 问题)
-                        _info "正在配置端口跳跃 iptables 规则..."
+                        # 配置 iptables/ip6tables 规则
+                        _info "正在配置端口跳跃防火墙规则..."
                         iptables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j REDIRECT --to-ports ${port}
-                        if [ $? -eq 0 ]; then
-                            _success "iptables 规则已添加"
-                            # 保存规则（智能检测系统类型）
-                            _save_iptables_rules
-                        else
-                            _warning "iptables 规则添加失败，请手动配置或检查 iptables 是否可用"
-                            _warning "可能原因：系统未加载 ip_tables/iptable_nat 模块，或 LXC 容器无权限"
-                        fi
+                        [ -x "$(command -v ip6tables)" ] && ip6tables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j REDIRECT --to-ports ${port}
+                        
+                        _success "端口跳跃规则已添加"
+                        _save_iptables_rules
                     fi
                 fi
             else
@@ -3739,8 +3715,7 @@ _create_third_party_adapter() {
         echo "  密码: $(echo "$adapter_inbound" | jq -r '.password')"
     fi
     echo ""
-    _info "此节点现在可作为落地机进行中转配置！"
-    _info "请使用「进阶功能」生成 Token 并配置中转。"
+    _info "此节点现在可作为落地机使用！"
     
     _manage_service "restart"
 }
@@ -3776,27 +3751,6 @@ _update_script() {
     fi
     
     # 更新子脚本 (advanced_relay.sh)
-    local sub_script_name="advanced_relay.sh"
-    local sub_script_path="/root/${sub_script_name}"
-    local sub_script_url="https://raw.githubusercontent.com/loymay/ssb/main/${sub_script_name}"
-    
-    _info "正在从 GitHub 下载子脚本..."
-    local temp_sub_path="${sub_script_path}.tmp"
-    
-    if wget -qO "$temp_sub_path" "$sub_script_url"; then
-        if [ -s "$temp_sub_path" ]; then
-            chmod +x "$temp_sub_path"
-            mv "$temp_sub_path" "$sub_script_path"
-            _success "子脚本 (advanced_relay.sh) 更新成功！"
-        else
-            _warning "子脚本下载失败或文件为空，跳过更新。"
-            rm -f "$temp_sub_path"
-        fi
-    else
-        _warning "子脚本下载失败，跳过更新。进阶功能可能使用旧版本。"
-        rm -f "$temp_sub_path"
-    fi
-    
     _success "脚本更新完成！"
     _info "请重新运行脚本以加载新版本："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
@@ -3824,42 +3778,6 @@ _update_singbox_core() {
     fi
 }
 
-# --- 进阶功能 (子脚本) ---
-_advanced_features() {
-    local script_name="advanced_relay.sh"
-    # 优先检查 /root 目录 (用户要求)
-    local script_path="/root/${script_name}"
-    
-    # [开发测试兼容] 如果 /root 下没有，但当前目录下有 (比如手动上传了)，则使用当前目录的
-    if [ ! -f "$script_path" ] && [ -f "./${script_name}" ]; then
-        script_path="./${script_name}"
-    fi
-
-    # 如果都不存在，则下载
-    if [ ! -f "$script_path" ]; then
-        _info "本地未检测到进阶脚本，正在尝试下载..."
-        local download_url="https://raw.githubusercontent.com/loymay/ssb/main/${script_name}"
-        
-        if wget -qO "$script_path" "$download_url"; then
-            chmod +x "$script_path"
-            _success "下载成功！"
-        else
-            _error "下载失败！请检查网络或确认 GitHub 仓库地址。"
-            # 清理可能的空文件
-            rm -f "$script_path"
-            return 1
-        fi
-    fi
-
-    # 执行脚本
-    if [ -f "$script_path" ]; then
-        # 赋予权限并执行
-        chmod +x "$script_path"
-        bash "$script_path"
-    else
-        _error "找不到进阶脚本文件: ${script_path}"
-    fi
-}
 
 _main_menu() {
     while true; do
@@ -3930,16 +3848,12 @@ _main_menu() {
         echo -e "   ${GREEN}[14]${NC} 更新核心         ${RED}[15]${NC} 卸载脚本"
         echo ""
         
-        # 进阶功能
-        echo -e "  ${CYAN}【进阶功能】${NC}"
-        echo -e "   ${GREEN}[16]${NC} 落地/中转配置"
-        echo ""
         
         echo -e "  ─────────────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-16]: " choice
+        read -p "  请输入选项 [0-15]: " choice
 
         case $choice in
             1) _show_add_node_menu ;;
@@ -3957,7 +3871,6 @@ _main_menu() {
             13) _update_script ;;
             14) _update_singbox_core ;;
             15) _uninstall ;; 
-            16) _advanced_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -4576,15 +4489,12 @@ _batch_create_nodes() {
             if ! _ensure_iptables; then
                 _warning "iptables 不可用，端口跳跃配置跳过。"
             else
-                _info "正在配置端口跳跃 iptables 规则..."
-                iptables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j DNAT --to-destination 127.0.0.1:${port}
-                if [ $? -eq 0 ]; then
-                    _success "iptables 规则已添加"
-                    _save_iptables_rules
-                else
-                    _warning "iptables 规则添加失败"
-                    _warning "可能原因：系统未加载 ip_tables/iptable_nat 模块，或 LXC 容器无权限"
-                fi
+                _info "正在配置端口跳跃防火墙规则..."
+                iptables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port}
+                [ -x "$(command -v ip6tables)" ] && ip6tables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port}
+                
+                _success "端口跳跃规则已添加"
+                _save_iptables_rules
             fi
         fi
     fi
