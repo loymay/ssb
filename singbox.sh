@@ -2176,6 +2176,7 @@ _add_anytls() {
 }
 
 _add_vless_reality() {
+    _info "--- VLESS (Reality+Vision) 设置向导 ---"
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
     local node_ip=${custom_ip:-$server_ip}
     read -p "请输入伪装域名 (默认: www.microsoft.com): " camouflage_domain
@@ -2194,41 +2195,7 @@ _add_vless_reality() {
     local public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
     local short_id=$(${SINGBOX_BIN} generate rand --hex 8)
     local tag="vless-in-${port}"
-    # IPv6处理：YAML用原始IP，链接用带[]的IP
-    local yaml_ip="$node_ip"
-    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
-    
-    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pk "$private_key" --arg sid "$short_id" \
-        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$public_key\", \"shortId\": \"$short_id\"}}" || return 1
-    
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
-        '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
-    _add_node_to_yaml "$proxy_json"
-    _success "VLESS (REALITY) 节点 [${name}] 添加成功!"
-}
-
-_add_vless_xtls_reality() {
-    _info "--- VLESS (XTLS+REALITY) 设置向导 ---"
-    read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-    local node_ip=${custom_ip:-$server_ip}
-    read -p "请输入伪装域名 (默认: www.microsoft.com): " camouflage_domain
-    local server_name=${camouflage_domain:-"www.microsoft.com"}
-    
-    read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
-    
-    # [!] 自定义名称 (包含地区旗帜)
-    local default_name="VLESS-XTLS-REALITY-${port}"
-    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-    local name="${server_flag}${custom_name:-$default_name}"
-
-    local uuid=$(${SINGBOX_BIN} generate uuid)
-    local keypair=$(${SINGBOX_BIN} generate reality-keypair)
-    local private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-    local public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-    local short_id=$(${SINGBOX_BIN} generate rand --hex 8)
-    local tag="vless-xtls-in-${port}"
+    # IPv6处理
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
     
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pk "$private_key" --arg sid "$short_id" \
@@ -2244,12 +2211,13 @@ _add_vless_xtls_reality() {
     local params="security=reality&sni=${server_name}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&flow=xtls-rprx-vision"
     local share_link="vless://${uuid}@${link_ip}:${port}?${params}#$(_url_encode "$name")"
     
-    _success "VLESS (XTLS+REALITY) 节点 [${name}] 添加成功!"
+    _success "VLESS (REALITY) 节点 [${name}] 添加成功!"
     echo "-------------------------------------------"
     echo -e "${YELLOW}分享链接:${NC}"
     echo "$share_link"
     echo "-------------------------------------------"
 }
+
 
 _add_vless_grpc_reality() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
@@ -4571,42 +4539,40 @@ _show_add_node_menu() {
     echo ""
     
     echo -e "  ${CYAN}【协议选择】${NC}"
-    echo -e "    ${GREEN}[1]${NC} VLESS (Vision+REALITY)"
-    echo -e "    ${GREEN}[2]${NC} VLESS (XTLS+REALITY)"
-    echo -e "    ${GREEN}[3]${NC} VLESS (gRPC+REALITY)"
-    echo -e "    ${GREEN}[4]${NC} VLESS (WebSocket+TLS)"
-    echo -e "    ${GREEN}[5]${NC} Trojan (WebSocket+TLS)"
-    echo -e "    ${GREEN}[6]${NC} AnyTLS"
-    echo -e "    ${GREEN}[7]${NC} Hysteria2"
-    echo -e "    ${GREEN}[8]${NC} TUICv5"
-    echo -e "    ${GREEN}[9]${NC} Shadowsocks"
-    echo -e "    ${GREEN}[10]${NC} VLESS (TCP)"
-    echo -e "    ${GREEN}[11]${NC} SOCKS5"
+    echo -e "    ${GREEN}[1]${NC} VLESS (Reality+Vision)"
+    echo -e "    ${GREEN}[2]${NC} VLESS (gRPC+REALITY)"
+    echo -e "    ${GREEN}[3]${NC} VLESS (WebSocket+TLS)"
+    echo -e "    ${GREEN}[4]${NC} Trojan (WebSocket+TLS)"
+    echo -e "    ${GREEN}[5]${NC} AnyTLS"
+    echo -e "    ${GREEN}[6]${NC} Hysteria2"
+    echo -e "    ${GREEN}[7]${NC} TUICv5"
+    echo -e "    ${GREEN}[8]${NC} Shadowsocks"
+    echo -e "    ${GREEN}[9]${NC} VLESS (TCP)"
+    echo -e "    ${GREEN}[10]${NC} SOCKS5"
     echo ""
     
     echo -e "  ${CYAN}【快捷功能】${NC}"
-    echo -e "   ${GREEN}[12]${NC} 批量创建节点"
+    echo -e "   ${GREEN}[11]${NC} 批量创建节点"
     echo ""
     
     echo -e "  ─────────────────────────────────────────"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     
-    read -p "  请输入选项 [0-12]: " choice
+    read -p "  请输入选项 [0-11]: " choice
 
     case $choice in
         1) _add_vless_reality; action_result=$? ;;
-        2) _add_vless_xtls_reality; action_result=$? ;;
-        3) _add_vless_grpc_reality; action_result=$? ;;
-        4) _add_vless_ws_tls; action_result=$? ;;
-        5) _add_trojan_ws_tls; action_result=$? ;;
-        6) _add_anytls; action_result=$? ;;
-        7) _add_hysteria2; action_result=$? ;;
-        8) _add_tuic; action_result=$? ;;
-        9) _add_shadowsocks_menu; action_result=$? ;;
-        10) _add_vless_tcp; action_result=$? ;;
-        11) _add_socks; action_result=$? ;;
-        12) _batch_create_nodes; return ;;
+        2) _add_vless_grpc_reality; action_result=$? ;;
+        3) _add_vless_ws_tls; action_result=$? ;;
+        4) _add_trojan_ws_tls; action_result=$? ;;
+        5) _add_anytls; action_result=$? ;;
+        6) _add_hysteria2; action_result=$? ;;
+        7) _add_tuic; action_result=$? ;;
+        8) _add_shadowsocks_menu; action_result=$? ;;
+        9) _add_vless_tcp; action_result=$? ;;
+        10) _add_socks; action_result=$? ;;
+        11) _batch_create_nodes; return ;;
         0) return ;;
         *) _error "无效输入，请重试。" ;;
     esac
