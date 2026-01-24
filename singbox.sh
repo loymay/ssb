@@ -4283,11 +4283,11 @@ _batch_create_nodes() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
     local node_ip=${custom_ip:-$server_ip}
     
-    # 2. 从这里开始，调整交互顺序
+    # 2. 交互输入
     local start_port=""
     while true; do
         echo ""
-        read -p "请输入批量创建节点的起始端口 (将占用连续4个端口): " input_port
+        read -p "请输入批量创建节点的起始端口 (将占用连续 3 个端口): " input_port
         start_port="$input_port"
         
         if [[ -z "$start_port" ]]; then
@@ -4296,22 +4296,31 @@ _batch_create_nodes() {
         fi
         
         if [[ "$start_port" =~ ^[0-9]+$ ]]; then
-            if [ "$start_port" -lt 1 ] || [ "$start_port" -gt 65500 ]; then
-                 _error "端口必须在 1-65500 之间"
+            if [ "$start_port" -lt 1 ] || [ "$start_port" -gt 65530 ]; then
+                 _error "端口必须在 1-65530 之间"
             else
                  break
             fi
         else
-            _error "输入错误！请输入单个数字端口号（例如 11000），不要输入范围！"
+            _error "输入错误！请输入数字端口号。"
         fi
     done
     
-    local batch_end_port=$((start_port + 3))
+    local batch_end_port=$((start_port + 2))
     _info "批量协议将占用端口范围: ${CYAN}${start_port} - ${batch_end_port}${NC}"
     
-    # 3. (新增) 输入自定义 SNI
+    # 3. 输入自定义域名和节点名称
     read -p "请输入伪装域名 (SNI) (默认: www.microsoft.com): " input_sni
     local custom_sni=${input_sni:-"www.microsoft.com"}
+
+    local default_base="Batch"
+    read -p "请输入节点基础名称 (默认: ${default_base}): " input_name
+    local base_name=${input_name:-$default_base}
+    
+    # 构建包含国旗和后缀的最终名称
+    local name_vl="${server_flag}${base_name}_vl"
+    local name_hy2="${server_flag}${base_name}_hy2"
+    local name_tu="${server_flag}${base_name}_tu"
     
     # 4. (调整) 询问是否开启 Hysteria2 端口跳跃
     local hy2_port_hopping=""
@@ -4349,16 +4358,15 @@ _batch_create_nodes() {
         fi
     fi
     
-    # 4. 显示将要创建的节点
+    # 5. 显示将要创建的节点
     echo ""
     _info "将创建以下节点："
-    echo -e "    ${GREEN}[1]${NC} VLESS Reality    端口: $((start_port))"
-    echo -e "    ${GREEN}[2]${NC} Hysteria2        端口: $((start_port + 1))"
+    echo -e "    ${GREEN}[1]${NC} VLESS Reality    端口: $((start_port))     名称: ${name_vl}"
+    echo -e "    ${GREEN}[2]${NC} Hysteria2        端口: $((start_port + 1)) 名称: ${name_hy2}"
     if [ -n "$hy2_port_hopping" ]; then
         echo -e "        └─ 端口跳跃: ${hy2_port_hopping}"
     fi
-    echo -e "    ${GREEN}[3]${NC} TUIC             端口: $((start_port + 2))"
-    echo -e "    ${GREEN}[4]${NC} Shadowsocks      端口: $((start_port + 3))"
+    echo -e "    ${GREEN}[3]${NC} TUIC             端口: $((start_port + 2)) 名称: ${name_tu}"
     echo ""
     
     read -p "确认创建? (Y/n): " confirm
@@ -4367,13 +4375,12 @@ _batch_create_nodes() {
         return 1
     fi
     
-    # 5. 开始批量创建
+    # 6. 开始批量创建
     local port=$start_port
     local success_count=0
-    local name_prefix="Batch"
     
     # VLESS Reality
-    _info "正在创建 VLESS Reality..."
+    _info "正在创建 VLESS Reality (${name_vl})..."
     local tag="vless-in-${port}"
     local uuid=$(${SINGBOX_BIN} generate uuid)
     local keypair=$(${SINGBOX_BIN} generate reality-keypair)
@@ -4390,14 +4397,14 @@ _batch_create_nodes() {
     local meta_json=$(jq -n --arg pk "$pbk" --arg sid "$sid" '{"publicKey": $pk, "shortId": $sid}')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
     
-    local proxy_json=$(jq -n --arg n "${name_prefix}-Reality-${port}" --arg s "$node_ip" --arg p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pbk" --arg sid "$sid" --arg f "$flow" \
+    local proxy_json=$(jq -n --arg n "$name_vl" --arg s "$node_ip" --arg p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pbk" --arg sid "$sid" --arg f "$flow" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"flow":$f,"tls":true,"servername":$sn,"reality-opts":{"public-key":$pk,"short-id":$sid},"client-fingerprint":"chrome","network":"tcp"}')
     _add_node_to_yaml "$proxy_json"
     success_count=$((success_count + 1))
     
     # Hysteria2
     port=$((start_port + 1))
-    _info "正在创建 Hysteria2..."
+    _info "正在创建 Hysteria2 (${name_hy2})..."
     tag="hy2-in-${port}"
     local password=$(${SINGBOX_BIN} generate rand --hex 16)
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
@@ -4413,72 +4420,32 @@ _batch_create_nodes() {
     # 配置端口跳跃
     if [ -n "$hy2_port_hopping" ]; then
         local hop_count=$((hy2_hop_end - hy2_hop_start + 1))
-        local use_multiport="false"
-
-        if [ "$hop_count" -le 1000 ]; then
-             _info "端口范围适中 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
-             use_multiport="true"
-             
-             _info "正在生成多端口监听配置 (${hy2_hop_start}-${hy2_hop_end})..."
-             
-             # 使用 Bash 循环构建 JSON 数组
-             local multi_json_array="["
-             local first=true
-             
-             for ((p=hy2_hop_start; p<=hy2_hop_end; p++)); do
-                 # 跳过主端口
-                 if [ "$p" -eq "$port" ]; then continue; fi
-                 
-                 if [ "$first" = true ]; then first=false; else multi_json_array+=","; fi
-                 
-                 local hop_tag="${tag}-hop-${p}"
-                 local item_json=$(jq -n --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
-                    '{
-                        "type": "hysteria2",
-                        "tag": $t,
-                        "listen": "::",
-                        "listen_port": ($p|tonumber),
-                        "users": [{"password": $pw}],
-                        "tls": {
-                            "enabled": true,
-                            "alpn": ["h3"],
-                            "certificate_path": $cert,
-                            "key_path": $key
-                        }
-                    }')
-                 multi_json_array+="$item_json"
-             done
-             multi_json_array+="]"
-
-             _atomic_modify_json "$CONFIG_FILE" ".inbounds += $multi_json_array"
-             _success "已添加 ${hop_count} 个辅助监听端口"
-        else
-            _info "端口范围较大，将尝试使用 iptables 转发模式..."
-            if ! _ensure_iptables; then
-                _warning "iptables 不可用，端口跳跃配置跳过。"
-            else
-                _info "正在配置端口跳跃防火墙规则..."
-                iptables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port}
-                [ -x "$(command -v ip6tables)" ] && ip6tables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port}
-                
-                _success "端口跳跃规则已添加"
-                _save_iptables_rules
-            fi
-        fi
+        local multi_json_array="["
+        local first=true
+        for ((p=hy2_hop_start; p<=hy2_hop_end; p++)); do
+            if [ "$p" -eq "$port" ]; then continue; fi
+            if [ "$first" = true ]; then first=false; else multi_json_array+=","; fi
+            local hop_tag="${tag}-hop-${p}"
+            local item_json=$(jq -n --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
+               '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+            multi_json_array+="$item_json"
+        done
+        multi_json_array+="]"
+        _atomic_modify_json "$CONFIG_FILE" ".inbounds += $multi_json_array"
     fi
     
     meta_json=$(jq -n --arg hop "$hy2_port_hopping" \
         '{"up": "1000 Mbps", "down": "1000 Mbps"} | if $hop != "" then .portHopping = $hop else . end')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
     
-    proxy_json=$(jq -n --arg n "${name_prefix}-Hy2-${port}" --arg s "$node_ip" --arg p "$port" --arg pw "$password" --arg sn "$sni" --arg hop "$hy2_port_hopping" \
+    proxy_json=$(jq -n --arg n "$name_hy2" --arg s "$node_ip" --arg p "$port" --arg pw "$password" --arg sn "$sni" --arg hop "$hy2_port_hopping" \
         '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":"1000 Mbps","down":"1000 Mbps"} | if $hop != "" then .ports = $hop else . end')
     _add_node_to_yaml "$proxy_json"
     success_count=$((success_count + 1))
     
     # TUIC
     port=$((start_port + 2))
-    _info "正在创建 TUIC..."
+    _info "正在创建 TUIC (${name_tu})..."
     tag="tuic-in-${port}"
     uuid=$(${SINGBOX_BIN} generate uuid)
     password=$(${SINGBOX_BIN} generate rand --hex 16)
@@ -4492,38 +4459,16 @@ _batch_create_nodes() {
         '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
     
-    proxy_json=$(jq -n --arg n "${name_prefix}-TUIC-${port}" --arg s "$node_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" \
+    proxy_json=$(jq -n --arg n "$name_tu" --arg s "$node_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" \
         '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"congestion-controller":"bbr","udp-relay-mode":"native"}')
-    _add_node_to_yaml "$proxy_json"
-    success_count=$((success_count + 1))
-    
-    # Shadowsocks
-    port=$((start_port + 3))
-    _info "正在创建 Shadowsocks..."
-    tag="ss-in-${port}"
-    password=$(${SINGBOX_BIN} generate rand --base64 16)
-    local method="2022-blake3-aes-128-gcm"
-    
-    inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg m "$method" \
-        '{"type":"shadowsocks","tag":$t,"listen":"::","listen_port":($p|tonumber),"method":$m,"password":$pw}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
-    
-    proxy_json=$(jq -n --arg n "${name_prefix}-SS-${port}" --arg s "$node_ip" --arg p "$port" --arg pw "$password" --arg m "$method" \
-        '{"name":$n,"type":"ss","server":$s,"port":($p|tonumber),"cipher":$m,"password":$pw}')
     _add_node_to_yaml "$proxy_json"
     success_count=$((success_count + 1))
     
     # 6. 完成
     echo ""
-    _success "批量创建完成！成功创建 ${success_count} 个节点"
-    
-    # 重启服务
+    _success "批量创建完成！已成功创建 ${success_count} 个节点。"
     _info "正在重启服务..."
     _manage_service "restart"
-    
-    echo ""
-    _info "使用 [查看节点链接] 可查看所有节点的分享链接"
-    
     return 0
 }
 
