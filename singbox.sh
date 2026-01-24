@@ -4420,18 +4420,46 @@ _batch_create_nodes() {
     # 配置端口跳跃
     if [ -n "$hy2_port_hopping" ]; then
         local hop_count=$((hy2_hop_end - hy2_hop_start + 1))
-        local multi_json_array="["
-        local first=true
-        for ((p=hy2_hop_start; p<=hy2_hop_end; p++)); do
-            if [ "$p" -eq "$port" ]; then continue; fi
-            if [ "$first" = true ]; then first=false; else multi_json_array+=","; fi
-            local hop_tag="${tag}-hop-${p}"
-            local item_json=$(jq -n --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
-               '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
-            multi_json_array+="$item_json"
-        done
-        multi_json_array+="]"
-        _atomic_modify_json "$CONFIG_FILE" ".inbounds += $multi_json_array"
+        
+        if [ "$hop_count" -le 100 ]; then
+             _info "端口范围较小 (${hop_count} 个)，将使用多端口监听模式..."
+             # 构建 JSON 数组字符串
+             local multi_json_array="["
+             local first=true
+             for ((p=hy2_hop_start; p<=hy2_hop_end; p++)); do
+                 if [ "$p" -eq "$port" ]; then continue; fi
+                 if [ "$first" = true ]; then first=false; else multi_json_array+=","; fi
+                 local hop_tag="${tag}-hop-${p}"
+                 local item_json=$(jq -n --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
+                    '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+                 multi_json_array+="$item_json"
+             done
+             multi_json_array+="]"
+             
+             # [修复] 使用临时文件避免 "Argument list too long"
+             echo "$multi_json_array" > "${SINGBOX_DIR}/batch_hops.tmp"
+             cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+             if jq --argjson hops "$(<${SINGBOX_DIR}/batch_hops.tmp)" '.inbounds += $hops' "${CONFIG_FILE}.bak" > "$CONFIG_FILE"; then
+                 rm -f "${CONFIG_FILE}.bak" "${SINGBOX_DIR}/batch_hops.tmp"
+             else
+                 _error "多端口入站配置合并失败，已回滚。"
+                 mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+             fi
+        else
+            _info "端口范围较大 (${hop_count} 个)，正在配置 iptables 转发模式..."
+            if ! _ensure_iptables; then
+                _warning "iptables 不可用，端口跳跃配置跳过。"
+            else
+                # 清理旧规则（如果存在）
+                iptables -t nat -D PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port} 2>/dev/null
+                # 添加新规则
+                iptables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port}
+                [ -x "$(command -v ip6tables)" ] && ip6tables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port} 2>/dev/null
+                
+                _success "iptables 端口跳跃规则已添加"
+                _save_iptables_rules
+            fi
+        fi
     fi
     
     meta_json=$(jq -n --arg hop "$hy2_port_hopping" \
