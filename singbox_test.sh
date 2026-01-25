@@ -316,44 +316,37 @@ _start_argo_tunnel() {
     local argo_auth="$3" # Token 或 JSON 字符串
     local argo_domain="$4" # 固定域名
     
-    # [Fix] 激进清理：强制杀掉所有 cloudflared 进程
+    # [Fix] 激进清理：强制杀掉所有 cloudflared 进程，防止 Token 模式下的多进程冲突
+    # Token 模式严禁多个进程使用同一 Token，否则会导致连接不断重置(Flapping)
     if pgrep -x "cloudflared" >/dev/null; then
-        _info "检测到残留的 cloudflared 进程，正在强制清理..." >&2
+        _info "检测到残留的 cloudflared 进程，正在强制清理..."
         pkill -x "cloudflared"
         sleep 2
+        # 再次检查，如果还在，发送 SIGKILL
         if pgrep -x "cloudflared" >/dev/null; then
              pkill -9 -x "cloudflared"
         fi
     fi
+    # 清理 PID 文件
     rm -f "$ARGO_PID_FILE"
+    
+    # 清理旧日志
     rm -f "${ARGO_LOG_FILE}"
     
-    # [检查] 确认本地端口是否正被 sing-box 监听
-    _info "检查本地端口 ${target_port} 状态..." >&2
-    local port_ready=false
-    for i in {1..10}; do
-        if ss -tlnp | grep -q ":${target_port} "; then
-            port_ready=true
-            break
-        fi
-        sleep 1
-    done
-    if [ "$port_ready" = false ]; then
-        _warning "警告: 本地端口 ${target_port} 尚未就绪，可能会导致隧道连接超时。" >&2
-    fi
-
     _info "正在启动 Argo 隧道..." >&2
     
     local tunnel_cmd=""
-    # 基础稳定性参数：禁用自动更新、自动IP版本、加强心跳包检测速度
-    local base_args="--edge-ip-version auto --no-autoupdate --heartbeat-interval 10s --heartbeat-count 3"
     
     if [ -n "$argo_auth" ] && [ -n "$argo_domain" ]; then
         # --- 固定域名模式 ---
         _info "模式: 固定域名 (Token/JSON)" >&2
+        
+        # 判断是 Token 还是 JSON
         if [[ "$argo_auth" =~ TunnelSecret ]]; then
             # JSON 模式
             echo "$argo_auth" > "${SINGBOX_DIR}/tunnel.json"
+            
+            # 生成最小化配置文件
              cat > "${SINGBOX_DIR}/tunnel.yml" <<EOF
 tunnel: $(echo "$argo_auth" | jq -r .TunnelID)
 credentials-file: ${SINGBOX_DIR}/tunnel.json
@@ -362,89 +355,108 @@ ingress:
     service: http://localhost:${target_port}
   - service: http_status:404
 EOF
-            tunnel_cmd="${CLOUDFLARED_BIN} tunnel ${base_args} --config ${SINGBOX_DIR}/tunnel.yml run"
+            # [Fix] 添加稳定性参数
+            tunnel_cmd="${CLOUDFLARED_BIN} tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --config ${SINGBOX_DIR}/tunnel.yml run"
+            
         elif [[ "$argo_auth" =~ [A-Z0-9a-z=]{100,} ]]; then
-            # Token 模式 (环境变量方式最稳定)
-            cat > "${SINGBOX_DIR}/start_argo.sh" <<EOF
-#!/bin/sh
-export TUNNEL_TOKEN='$argo_auth'
-exec ${CLOUDFLARED_BIN} tunnel ${base_args} run
-EOF
-            chmod +x "${SINGBOX_DIR}/start_argo.sh"
-            tunnel_cmd="${SINGBOX_DIR}/start_argo.sh"
+            # Token 模式
+            # 注意: Token 本身是一个长字符串，我们直接将其作为参数传递，不加额外引号，
+            # 或者确保整个命令在 exec/eval 时被正确处理。
+            # 在这里直接构建命令字符串供后续 execution (注意: 下面使用的是 nohup ${tunnel_cmd}，shell 会拆分参数)
+            # 最安全的方式是把 token 放入单引号，防止 $ 符号被解析（虽然 base64 只有 +/，没 $）
+            tunnel_cmd="${CLOUDFLARED_BIN} tunnel --token '${argo_auth}' run"
+        else
+            _error "无法识别的 Argo 认证格式 (不是 Token 也不是 JSON)" >&2
+            return 1
         fi
+        
     else
         # --- 临时 TryCloudflare 模式 ---
         _info "模式: 临时隧道 (TryCloudflare)" >&2
-        # 不强制 http2，让进程自协商 QUIC，效率和抗干扰能力更高
-        tunnel_cmd="${CLOUDFLARED_BIN} tunnel ${base_args} --url http://localhost:${target_port} --logfile ${ARGO_LOG_FILE}"
+        # [Fix] 添加稳定性参数
+        tunnel_cmd="${CLOUDFLARED_BIN} tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --url http://localhost:${target_port} --logfile ${ARGO_LOG_FILE}"
     fi
 
-    # 执行启动
-    if [ -n "$argo_domain" ] && [[ ! "$tunnel_cmd" == *"--logfile"* ]]; then
-        # 固定域名且是非脚本形式 (JSON配置模式)
-        nohup ${tunnel_cmd} > "${ARGO_LOG_FILE}" 2>&1 &
+     # 执行启动
+     if [ -n "$argo_domain" ]; then
+         # 固定模式，后台运行并记录 PID，同时记录日志以便排错
+         # 最终解决方案：直接构造完整的 sh 命令字符串，避免变量展开时的引号地狱
+         # 我们把 token 放在这里面，sh -c 的参数用双引号，内部 token 用单引号
+         
+         if [[ "$argo_auth" =~ TunnelSecret ]]; then 
+             # JSON 模式已经通过 config file 运行，cmd 比较简单，没特殊字符，直接运行
+             nohup ${tunnel_cmd} > "${ARGO_LOG_FILE}" 2>&1 &
+         else
+             # Token 模式
+             # 为了避免命令行 Token 带来的转义问题，官方推荐使用环境变量 TUNNEL_TOKEN
+             # 这样最为稳妥，也不会泄露 Token 到进程列表
+             
+             cat > "${SINGBOX_DIR}/start_argo.sh" <<EOF
+#!/bin/sh
+export TUNNEL_TOKEN='$argo_auth'
+# [Fix] 添加稳定性参数: 自动IP版本、禁止自动更新、强制HTTP2协议(更稳定)
+exec ${CLOUDFLARED_BIN} tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run
+EOF
+             chmod +x "${SINGBOX_DIR}/start_argo.sh"
+             nohup "${SINGBOX_DIR}/start_argo.sh" > "${ARGO_LOG_FILE}" 2>&1 &
+         fi
+         
+         local cf_pid=$!
+         echo "$cf_pid" > "${ARGO_PID_FILE}"
+         
+         _info "等待隧道启动..." >&2
+         sleep 5
+         if ! kill -0 "$cf_pid" 2>/dev/null; then
+             _error "Argo 启动失败。详细日志：" >&2
+             # 尝试从 nohup.out 或 stderr 获取信息 (修正前的 nohup >/dev/null 丢失了这些信息)
+             # 对于固定隧道，我们这次把日志重定向到一个临时文件以便排查
+             # 只显示最后 20 行，避免刷屏
+             tail -n 20 "${ARGO_LOG_FILE}" >&2
+             return 1
+         fi
+         _success "Argo 隧道启动成功 (固定域名)" >&2
+         echo "$argo_domain"
+         return 0
     else
-        # Token 模式 (脚本) 或 临时模式
-        if [[ "$tunnel_cmd" == *.sh ]]; then
-            nohup "$tunnel_cmd" > "${ARGO_LOG_FILE}" 2>&1 &
-        else
-            # 临时模式直接执行，本身带 --logfile 参数
-            ${tunnel_cmd} > /dev/null 2>&1 &
-        fi
-    fi
-    
-    local cf_pid=$!
-    echo "$cf_pid" > "${ARGO_PID_FILE}"
-    
-    # 状态实时解析验证
-    _info "等待隧道建立 (解析日志中)..." >&2
-    local tunnel_domain=""
-    local wait_count=0
-    local max_wait=40
-    local registered=false
-
-    while [ $wait_count -lt $max_wait ]; do
-        sleep 2
-        wait_count=$((wait_count + 2))
+        # 临时模式
+        ${tunnel_cmd} > /dev/null 2>&1 & 
+        local cf_pid=$!
+        echo "$cf_pid" > "${ARGO_PID_FILE}"
         
-        if ! kill -0 "$cf_pid" 2>/dev/null; then
-            _error "cloudflared 进程异常退出！日志后 20 行：" >&2
+        # 等待隧道启动并获取域名
+        _info "等待隧道建立 (最多30秒)..." >&2
+        local tunnel_domain=""
+        local wait_count=0
+        local max_wait=30
+        
+        while [ $wait_count -lt $max_wait ]; do
+            sleep 2
+            wait_count=$((wait_count + 2))
+             if ! kill -0 "$cf_pid" 2>/dev/null; then
+                _error "cloudflared 进程已退出，请检查日志: ${ARGO_LOG_FILE}" >&2
+                cat "${ARGO_LOG_FILE}" 2>/dev/null | tail -20 >&2
+                return 1
+            fi
+            if [ -f "${ARGO_LOG_FILE}" ]; then
+                tunnel_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "${ARGO_LOG_FILE}" 2>/dev/null | tail -1 | sed 's|https://||')
+                if [ -n "$tunnel_domain" ]; then
+                    break
+                fi
+            fi
+            echo -n "." >&2
+        done
+        echo "" >&2
+        
+        if [ -z "$tunnel_domain" ]; then
+            _error "无法获取隧道域名 (超时)，请检查日志: ${ARGO_LOG_FILE}" >&2
             cat "${ARGO_LOG_FILE}" 2>/dev/null | tail -20 >&2
             return 1
         fi
         
-        if [ -f "${ARGO_LOG_FILE}" ]; then
-            # A. 提取域名
-            if [ -z "$tunnel_domain" ]; then
-                tunnel_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "${ARGO_LOG_FILE}" 2>/dev/null | tail -1 | sed 's|https://||')
-            fi
-            # B. 验证注册状态 (看到 Registered 才是正真通了)
-            if grep -qi "Registered tunnel" "${ARGO_LOG_FILE}" || grep -qi "established" "${ARGO_LOG_FILE}"; then
-                registered=true
-                [ -n "$argo_domain" ] && tunnel_domain="$argo_domain"
-            fi
-            
-            [ -n "$tunnel_domain" ] && [ "$registered" = true ] && break
-        fi
-        echo -n "." >&2
-    done
-    echo "" >&2
-    
-    if [ -z "$tunnel_domain" ] || [ "$registered" = false ]; then
-        _error "Argo 建立失败 (状态未就绪)。" >&2
-        cat "${ARGO_LOG_FILE}" 2>/dev/null | tail -15 >&2
-        return 1
+        _success "Argo 隧道启动成功!" >&2
+        _success "隧道域名: ${tunnel_domain}" >&2
+        echo "$tunnel_domain"
     fi
-    
-    # [关键补偿] 即使日志显示注册成功，边缘 DNS 传播仍需极短时间
-    # 延迟 3 秒可解决 90% 以上首次启动“不通”的问题
-    sleep 3
-    
-    _success "Argo 隧道启动成功！" >&2
-    [ -z "$argo_domain" ] && _success "隧道域名: ${tunnel_domain}" >&2
-    echo "$tunnel_domain"
-    return 0
 }
 
 _stop_argo_tunnel() {
@@ -4257,233 +4269,245 @@ EOF
     _success "节点信息已写入 /etc/motd (SSH登录时自动显示)"
 }
 
-# 批量创建节点
+# 批量创建节点 (测试版：选择性创建)
 _batch_create_nodes() {
     clear
     echo -e "${CYAN}"
     echo '  ╔═══════════════════════════════════════╗'
-    echo '  ║          批量创建节点                 ║'
+    echo '  ║          批量协议部署 (测试)          ║'
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
-    echo ""
     
-    # 1. 输入服务器 IP
-    read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-    local node_ip=${custom_ip:-$server_ip}
-    
-    # 2. 交互输入
-    local start_port=""
-    while true; do
-        echo ""
-        read -p "请输入批量创建节点的起始端口 (将占用连续 3 个端口): " input_port
-        start_port="$input_port"
-        
-        if [[ -z "$start_port" ]]; then
-             _error "起始端口不能为空！"
-             continue
-        fi
-        
-        if [[ "$start_port" =~ ^[0-9]+$ ]]; then
-            if [ "$start_port" -lt 1 ] || [ "$start_port" -gt 65530 ]; then
-                 _error "端口必须在 1-65530 之间"
-            else
-                 break
-            fi
-        else
-            _error "输入错误！请输入数字端口号。"
-        fi
-    done
-    
-    local batch_end_port=$((start_port + 2))
-    _info "批量协议将占用端口范围: ${CYAN}${start_port} - ${batch_end_port}${NC}"
-    
-    # 3. 输入自定义域名和节点名称
-    read -p "请输入伪装域名 (SNI) (默认: www.microsoft.com): " input_sni
-    local custom_sni=${input_sni:-"www.microsoft.com"}
+    # 1. 协议列表定义
+    local protocols=(
+        "VLESS Reality (Reality+Vision)"
+        "VLESS gRPC (Reality)"
+        "VLESS WebSocket+TLS"
+        "Trojan WebSocket+TLS"
+        "AnyTLS"
+        "Hysteria2"
+        "TUICv5"
+        "Shadowsocks (2022-blake3)"
+        "VLESS TCP"
+        "SOCKS5"
+    )
+    local suffixes=("_vl" "_grpc" "_ws" "_tr" "_any" "_hy2" "_tu" "_ss" "_tcp" "_sk")
 
-    local default_base="Batch"
-    read -p "请输入节点基础名称 (默认: ${default_base}): " input_name
-    local base_name=${input_name:-$default_base}
-    
-    # 构建包含国旗和后缀的最终名称
-    local name_vl="${server_flag}${base_name}_vl"
-    local name_hy2="${server_flag}${base_name}_hy2"
-    local name_tu="${server_flag}${base_name}_tu"
-    
-    # 4. (调整) 询问是否开启 Hysteria2 端口跳跃
-    local hy2_port_hopping=""
-    local hy2_hop_start=""
-    local hy2_hop_end=""
-    
-    echo ""
-    read -p "是否开启 Hysteria2 端口跳跃? (y/N): " hop_choice
-    if [[ "$hop_choice" == "y" || "$hop_choice" == "Y" ]]; then
-        _info "请注意：跳跃范围不能包含 ${start_port}-${batch_end_port}"
-        read -p "请输入端口跳跃范围 (格式: 起始端口-结束端口, 例如 20000-30000): " hop_range
-        if [[ "$hop_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            hy2_hop_start="${BASH_REMATCH[1]}"
-            hy2_hop_end="${BASH_REMATCH[2]}"
-            
-            # 冲突检测
-            if [ "$hy2_hop_start" -lt "$hy2_hop_end" ]; then
-                # 检查是否重叠
-                if [ "$start_port" -ge "$hy2_hop_start" ] && [ "$start_port" -le "$hy2_hop_end" ] || \
-                   [ "$batch_end_port" -ge "$hy2_hop_start" ] && [ "$batch_end_port" -le "$hy2_hop_end" ]; then
-                   _error "错误：跳跃范围 ${hop_range} 与主端口范围 ${start_port}-${batch_end_port} 冲突！"
-                   _warning "端口跳跃将不会启用。"
-                   hy2_port_hopping=""
-                   hy2_hop_start=""
-                   hy2_hop_end=""
-                else
-                   hy2_port_hopping="$hop_range"
-                   _success "端口跳跃范围确认: ${hy2_hop_start}-${hy2_hop_end}"
-                fi
-            else
-                _error "端口范围无效 (起始必须小于结束)，端口跳跃未启用"
-            fi
-        else
-            _error "端口范围格式错误，端口跳跃未启用"
-        fi
-    fi
-    
-    # 5. 显示将要创建的节点
-    echo ""
-    _info "将创建以下节点："
-    echo -e "    ${GREEN}[1]${NC} VLESS Reality    端口: $((start_port))     名称: ${name_vl}"
-    echo -e "    ${GREEN}[2]${NC} Hysteria2        端口: $((start_port + 1)) 名称: ${name_hy2}"
-    if [ -n "$hy2_port_hopping" ]; then
-        echo -e "        └─ 端口跳跃: ${hy2_port_hopping}"
-    fi
-    echo -e "    ${GREEN}[3]${NC} TUIC             端口: $((start_port + 2)) 名称: ${name_tu}"
+    echo -e "  ${CYAN}可选协议：${NC}"
+    for i in "${!protocols[@]}"; do
+        echo -e "    ${GREEN}[$((i+1))]${NC} ${protocols[$i]}"
+    done
     echo ""
     
-    read -p "确认创建? (Y/n): " confirm
-    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
-        _warning "已取消批量创建"
+    # 2. 用户选择协议
+    read -p "  请输入要创建的协议序号 (空格隔开，例如 1 6 7): " select_input
+    if [[ -z "$select_input" ]]; then
+        _error "未选择任何协议"
         return 1
     fi
     
-    # 6. 开始批量创建
-    local port=$start_port
-    local success_count=0
+    # 3. 基础信息录入
+    read -p "  请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+    local node_ip=${custom_ip:-$server_ip}
     
-    # VLESS Reality
-    _info "正在创建 VLESS Reality (${name_vl})..."
-    local tag="vless-in-${port}"
-    local uuid=$(${SINGBOX_BIN} generate uuid)
-    local keypair=$(${SINGBOX_BIN} generate reality-keypair)
-    local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-    local pbk=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-    local sid=$(${SINGBOX_BIN} generate rand --hex 8)
-    local sni="$custom_sni"
-    local flow="xtls-rprx-vision"
-    
-    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg f "$flow" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
-        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
-    
-    local meta_json=$(jq -n --arg pk "$pbk" --arg sid "$sid" '{"publicKey": $pk, "shortId": $sid}')
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
-    
-    local proxy_json=$(jq -n --arg n "$name_vl" --arg s "$node_ip" --arg p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pbk" --arg sid "$sid" --arg f "$flow" \
-        '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"flow":$f,"tls":true,"servername":$sn,"reality-opts":{"public-key":$pk,"short-id":$sid},"client-fingerprint":"chrome","network":"tcp"}')
-    _add_node_to_yaml "$proxy_json"
-    success_count=$((success_count + 1))
-    
-    # Hysteria2
-    port=$((start_port + 1))
-    _info "正在创建 Hysteria2 (${name_hy2})..."
-    tag="hy2-in-${port}"
-    local password=$(${SINGBOX_BIN} generate rand --hex 16)
-    local cert_path="${SINGBOX_DIR}/${tag}.pem"
-    local key_path="${SINGBOX_DIR}/${tag}.key"
-    sni="$custom_sni"
-    
-    _generate_self_signed_cert "$sni" "$cert_path" "$key_path"
-    
-    inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
-        '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
-    
-    # 配置端口跳跃
-    if [ -n "$hy2_port_hopping" ]; then
-        local hop_count=$((hy2_hop_end - hy2_hop_start + 1))
-        
-        if [ "$hop_count" -le 100 ]; then
-             _info "端口范围较小 (${hop_count} 个)，将使用多端口监听模式..."
-             # 构建 JSON 数组字符串
-             local multi_json_array="["
-             local first=true
-             for ((p=hy2_hop_start; p<=hy2_hop_end; p++)); do
-                 if [ "$p" -eq "$port" ]; then continue; fi
-                 if [ "$first" = true ]; then first=false; else multi_json_array+=","; fi
-                 local hop_tag="${tag}-hop-${p}"
-                 local item_json=$(jq -n --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
-                    '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
-                 multi_json_array+="$item_json"
-             done
-             multi_json_array+="]"
-             
-             # [修复] 使用临时文件避免 "Argument list too long"
-             echo "$multi_json_array" > "${SINGBOX_DIR}/batch_hops.tmp"
-             cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
-             if jq --argjson hops "$(<${SINGBOX_DIR}/batch_hops.tmp)" '.inbounds += $hops' "${CONFIG_FILE}.bak" > "$CONFIG_FILE"; then
-                 rm -f "${CONFIG_FILE}.bak" "${SINGBOX_DIR}/batch_hops.tmp"
-             else
-                 _error "多端口入站配置合并失败，已回滚。"
-                 mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
-             fi
+    local start_port=""
+    while true; do
+        read -p "  请输入起始端口: " input_port
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -gt 0 ] && [ "$input_port" -lt 65000 ]; then
+            start_port="$input_port"
+            break
         else
-            _info "端口范围较大 (${hop_count} 个)，正在配置 iptables 转发模式..."
-            if ! _ensure_iptables; then
-                _warning "iptables 不可用，端口跳跃配置跳过。"
-            else
-                # 清理旧规则（如果存在）
-                iptables -t nat -D PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port} 2>/dev/null
-                # 添加新规则
-                iptables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port}
-                [ -x "$(command -v ip6tables)" ] && ip6tables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j REDIRECT --to-ports ${port} 2>/dev/null
-                
-                _success "iptables 端口跳跃规则已添加"
-                _save_iptables_rules
-            fi
+            _error "无效端口"
         fi
-    fi
+    done
     
-    meta_json=$(jq -n --arg hop "$hy2_port_hopping" \
-        '{"up": "1000 Mbps", "down": "1000 Mbps"} | if $hop != "" then .portHopping = $hop else . end')
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
+    read -p "  请输入伪装域名/SNI (默认: www.microsoft.com): " input_sni
+    local custom_sni=${input_sni:-"www.microsoft.com"}
+
+    read -p "  请输入节点基础名称 (默认: Batch): " input_base
+    local base_name=${input_base:-"Batch"}
+
+    # 4. 汇总预览
+    local selected_indexes=($select_input)
+    local current_port=$start_port
+    local tasks=()
     
-    proxy_json=$(jq -n --arg n "$name_hy2" --arg s "$node_ip" --arg p "$port" --arg pw "$password" --arg sn "$sni" --arg hop "$hy2_port_hopping" \
-        '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":"1000 Mbps","down":"1000 Mbps"} | if $hop != "" then .ports = $hop else . end')
-    _add_node_to_yaml "$proxy_json"
-    success_count=$((success_count + 1))
-    
-    # TUIC
-    port=$((start_port + 2))
-    _info "正在创建 TUIC (${name_tu})..."
-    tag="tuic-in-${port}"
-    uuid=$(${SINGBOX_BIN} generate uuid)
-    password=$(${SINGBOX_BIN} generate rand --hex 16)
-    cert_path="${SINGBOX_DIR}/${tag}.pem"
-    key_path="${SINGBOX_DIR}/${tag}.key"
-    sni="$custom_sni"
-    
-    _generate_self_signed_cert "$sni" "$cert_path" "$key_path"
-    
-    inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" --arg cert "$cert_path" --arg key "$key_path" \
-        '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
-    
-    proxy_json=$(jq -n --arg n "$name_tu" --arg s "$node_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" \
-        '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"congestion-controller":"bbr","udp-relay-mode":"native"}')
-    _add_node_to_yaml "$proxy_json"
-    success_count=$((success_count + 1))
-    
-    # 6. 完成
     echo ""
-    _success "批量创建完成！已成功创建 ${success_count} 个节点。"
-    _info "正在重启服务..."
+    _info "待创建任务清单："
+    for idx_raw in "${selected_indexes[@]}"; do
+        local idx=$((idx_raw - 1))
+        if [ $idx -ge 0 ] && [ $idx -lt ${#protocols[@]} ]; then
+            local final_name="${server_flag}${base_name}${suffixes[$idx]}"
+            echo -e "    - ${GREEN}${protocols[$idx]}${NC} -> ${CYAN}${final_name}${NC} (端口: ${current_port})"
+            tasks+=("$idx|$current_port|$final_name")
+            current_port=$((current_port + 1))
+        fi
+    done
+    
+    read -p "  确认执行? (Y/n): " confirm
+    [[ "$confirm" == "n" || "$confirm" == "N" ]] && return 1
+
+    # 5. 执行部署
+    local success_count=0
+    for task in "${tasks[@]}"; do
+        IFS='|' read -r p_idx p_port p_name <<< "$task"
+        _info "正在部署: ${p_name} ..."
+        
+        local tag=""
+        case $((p_idx + 1)) in
+            1) # VLESS Reality
+                tag="batch-vl-${p_port}"
+                local uuid=$(${SINGBOX_BIN} generate uuid)
+                local keypair=$(${SINGBOX_BIN} generate reality-keypair)
+                local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+                local pbk=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+                local sid=$(${SINGBOX_BIN} generate rand --hex 8)
+                
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg u "$uuid" --arg sn "$custom_sni" --arg pk "$pk" --arg sid "$sid" \
+                    '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$pbk\", \"shortId\": \"$sid\"}}"
+                
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg u "$uuid" --arg sn "$custom_sni" --arg pbk "$pbk" --arg sid "$sid" \
+                    '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+            
+            2) # VLESS gRPC
+                tag="batch-grpc-${p_port}"
+                local uuid=$(${SINGBOX_BIN} generate uuid)
+                local keypair=$(${SINGBOX_BIN} generate reality-keypair)
+                local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+                local pbk=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+                local sid=$(${SINGBOX_BIN} generate rand --hex 8)
+                local svc=$(${SINGBOX_BIN} generate rand --hex 8)
+                
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg u "$uuid" --arg sn "$custom_sni" --arg pk "$pk" --arg sid "$sid" --arg svc "$svc" \
+                    '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h2"],"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}},"transport":{"type":"grpc","service_name":$svc}}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$pbk\", \"shortId\": \"$sid\", \"serviceName\": \"$svc\"}}"
+                
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg u "$uuid" --arg sn "$custom_sni" --arg pbk "$pbk" --arg sid "$sid" --arg svc "$svc" \
+                    '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"grpc","servername":$sn,"reality-opts":{"public-key":$pbk,"short-id":$sid},"grpc-opts":{"grpc-service-name":$svc}}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+
+            3) # VLESS WS+TLS
+                tag="batch-ws-${p_port}"
+                local uuid=$(${SINGBOX_BIN} generate uuid)
+                local ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+                local cp="${SINGBOX_DIR}/${tag}.pem"; local kp="${SINGBOX_DIR}/${tag}.key"
+                _generate_self_signed_cert "$custom_sni" "$cp" "$kp" >/dev/null
+                
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg u "$uuid" --arg cp "$cp" --arg kp "$kp" --arg wsp "$ws_path" \
+                    '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u}],"tls":{"enabled":true,"certificate_path":$cp,"key_path":$kp},"transport":{"type":"ws","path":$wsp}}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg u "$uuid" --arg sn "$custom_sni" --arg wsp "$ws_path" \
+                    '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"ws","servername":$sn,"skip-cert-verify":true,"ws-opts":{"path":$wsp,"headers":{"Host":$sn}}}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+
+            4) # Trojan WS+TLS
+                tag="batch-tr-${p_port}"
+                local pw=$(${SINGBOX_BIN} generate rand --hex 16)
+                local ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+                local cp="${SINGBOX_DIR}/${tag}.pem"; local kp="${SINGBOX_DIR}/${tag}.key"
+                _generate_self_signed_cert "$custom_sni" "$cp" "$kp" >/dev/null
+                
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg pw "$pw" --arg cp "$cp" --arg kp "$kp" --arg wsp "$ws_path" \
+                    '{"type":"trojan","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"certificate_path":$cp,"key_path":$kp},"transport":{"type":"ws","path":$wsp}}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg pw "$pw" --arg sn "$custom_sni" --arg wsp "$ws_path" \
+                    '{"name":$n,"type":"trojan","server":$s,"port":($p|tonumber),"password":$pw,"tls":true,"network":"ws","sni":$sn,"skip-cert-verify":true,"ws-opts":{"path":$wsp,"headers":{"Host":$sn}}}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+
+            5) # AnyTLS
+                tag="batch-any-${p_port}"
+                local uuid=$(${SINGBOX_BIN} generate uuid)
+                local cp="${SINGBOX_DIR}/${tag}.pem"; local kp="${SINGBOX_DIR}/${tag}.key"
+                _generate_self_signed_cert "$custom_sni" "$cp" "$kp" >/dev/null
+                
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg pw "$uuid" --arg cp "$cp" --arg kp "$kp" --arg sn "$custom_sni" \
+                    '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=8"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cp,"key_path":$kp}}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg pw "$uuid" --arg sn "$custom_sni" \
+                    '{"name":$n,"type":"anytls","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"udp":true}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+                
+            6) # Hysteria2
+                tag="batch-hy2-${p_port}"
+                local cp="${SINGBOX_DIR}/${tag}.pem"; local kp="${SINGBOX_DIR}/${tag}.key"; local pw=$(${SINGBOX_BIN} generate rand --hex 16)
+                _generate_self_signed_cert "$custom_sni" "$cp" "$kp" >/dev/null
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg pw "$pw" --arg cp "$cp" --arg kp "$kp" \
+                    '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cp,"key_path":$kp}}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"up\":\"1000 Mbps\",\"down\":\"1000 Mbps\"}}"
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg pw "$pw" --arg sn "$custom_sni" \
+                    '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":"1000 Mbps","down":"1000 Mbps"}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+                
+            7) # TUIC
+                tag="batch-tuic-${p_port}"
+                local cp="${SINGBOX_DIR}/${tag}.pem"; local kp="${SINGBOX_DIR}/${tag}.key"; local uuid=$(${SINGBOX_BIN} generate uuid); local pw=$(${SINGBOX_BIN} generate rand --hex 16)
+                _generate_self_signed_cert "$custom_sni" "$cp" "$kp" >/dev/null
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg u "$uuid" --arg pw "$pw" --arg sn "$custom_sni" --arg cp "$cp" --arg kp "$kp" \
+                    '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cp,"key_path":$kp}}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg u "$uuid" --arg pw "$pw" --arg sn "$custom_sni" \
+                    '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"congestion-controller":"bbr","udp-relay-mode":"native"}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+
+            8) # Shadowsocks
+                tag="batch-ss-${p_port}"
+                local method="2022-blake3-aes-128-gcm"
+                local pw=$(${SINGBOX_BIN} generate rand --base64 16)
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg m "$method" --arg pw "$pw" \
+                    '{"type":"shadowsocks","tag":$t,"listen":"::","listen_port":($p|tonumber),"method":$m,"password":$pw}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg m "$method" --arg pw "$pw" \
+                    '{"name":$n,"type":"ss","server":$s,"port":($p|tonumber),"cipher":$m,"password":$pw}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+
+            9) # VLESS TCP (No TLS)
+                tag="batch-tcp-${p_port}"
+                local uuid=$(${SINGBOX_BIN} generate uuid)
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg u "$uuid" \
+                    '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u}],"tls":{"enabled":false}}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg u "$uuid" \
+                    '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":false,"network":"tcp"}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+
+            10) # SOCKS5
+                tag="batch-sk-${p_port}"
+                local user=$(${SINGBOX_BIN} generate rand --hex 8)
+                local pw=$(${SINGBOX_BIN} generate rand --hex 16)
+                local in_json=$(jq -n --arg t "$tag" --arg p "$p_port" --arg u "$user" --arg pw "$pw" \
+                    '{"type":"socks","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"username":$u,"password":$pw}]}')
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$in_json]"
+                local pr_json=$(jq -n --arg n "$p_name" --arg s "$node_ip" --arg p "$p_port" --arg u "$user" --arg pw "$pw" \
+                    '{"name":$n,"type":"socks5","server":$s,"port":($p|tonumber),"username":$u,"password":$pw}')
+                _add_node_to_yaml "$pr_json"
+                ;;
+                
+            *)
+                _warning "协议 [$((p_idx+1))] 的批量部署逻辑暂未在此测试版实现，已跳过。"
+                continue
+                ;;
+        esac
+        success_count=$((success_count + 1))
+    done
+
+    _success "批量部署完成！成功创建 ${success_count} 个节点。"
     _manage_service "restart"
     return 0
 }
