@@ -3735,6 +3735,45 @@ _update_singbox_core() {
 }
 
 
+# --- 进阶功能 (中转) ---
+_advanced_features() {
+    local script_name="advanced_relay.sh"
+    # 尝试在当前脚本所在目录寻找子脚本
+    local script_dir=$(dirname "$SELF_SCRIPT_PATH")
+    local local_script="${script_dir}/${script_name}"
+    
+    # 如果找不到，尝试从 GitHub 下载
+    if [ ! -f "$local_script" ]; then
+        _info "本地未找到 ${script_name}，正在尝试下载..."
+        
+        # 从主脚本 URL 推断 base URL
+        local base_url=$(dirname "$SCRIPT_UPDATE_URL")
+        local download_url="${base_url}/${script_name}"
+        
+        if curl -s --head --fail "$download_url" >/dev/null; then
+            if curl -s -L -o "$local_script" "$download_url"; then
+                chmod +x "$local_script"
+                _success "下载成功！"
+            else
+                _error "下载失败，请检查网络。"
+                return
+            fi
+        else
+            _error "无法找到远程脚本: $download_url"
+            return
+        fi
+    fi
+    
+    if [ -f "$local_script" ]; then
+        # 确保有执行权限
+        chmod +x "$local_script"
+        # 运行子脚本
+        bash "$local_script"
+    else
+        _error "无法执行进阶功能脚本。"
+    fi
+}
+
 _main_menu() {
     while true; do
         clear
@@ -3802,6 +3841,7 @@ _main_menu() {
         echo -e "  ${CYAN}【配置与更新】${NC}"
         echo -e "   ${GREEN}[12]${NC} 检查配置文件     ${GREEN}[13]${NC} 更新脚本"
         echo -e "   ${GREEN}[14]${NC} 更新核心         ${RED}[15]${NC} 卸载脚本"
+        echo -e "   ${GREEN}[16]${NC} 进阶功能 (中转)"
         echo ""
         
         
@@ -3827,6 +3867,7 @@ _main_menu() {
             13) _update_script ;;
             14) _update_singbox_core ;;
             15) _uninstall ;; 
+            16) _advanced_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
