@@ -513,10 +513,12 @@ _parse_landing_input() {
     local dest_addr=""
     local dest_port=""
     
-    # 1. 尝试识别是否为 base64 编码
-    if [[ "$input" =~ ^[A-Za-z0-9+/]+=*$ ]] && [[ ${#input} -gt 40 ]]; then
-        _info "检测到可能是 Base64 编码，尝试解码..."
-        local decoded=$(echo "$input" | base64 -d 2>/dev/null)
+    # 1. 尝试识别是否为 base64 编码 (使用 tr 清理并支持 URL-Safe 格式)
+    local test_input=$(echo "$input" | tr -d '[:space:]')
+    if [[ "$test_input" =~ ^[A-Za-z0-9+/_-]+=*$ ]] && [[ ${#test_input} -gt 30 ]]; then
+        _info "检测到可能是 Base64 格式，尝试解码..."
+        # 兼容 URL-Safe Base64
+        local decoded=$(echo "$test_input" | tr '_-' '/+' | base64 -d 2>/dev/null)
         
         if [ $? -eq 0 ] && [ -n "$decoded" ]; then
             # 检查解码后是否为分享链接
@@ -525,30 +527,28 @@ _parse_landing_input() {
                [[ "$decoded" == hysteria2://* ]] || [[ "$decoded" == hy2://* ]]; then
                 _success "识别为 Base64 编码的分享链接"
                 input="$decoded"
-            # 检查解码后是否为 JSON Token
-            elif echo "$decoded" | jq -e '.type' >/dev/null 2>&1; then
+            # 检查解码后是否为 JSON Token (检查是否含有 type 字段)
+            elif echo "$decoded" | grep -q "\"type\":" 2>/dev/null; then
                 _success "识别为 Base64 编码的 JSON Token (兼容原格式)"
-                dest_type=$(echo "$decoded" | jq -r '.type')
-                dest_addr=$(echo "$decoded" | jq -r '.addr')
-                dest_port=$(echo "$decoded" | jq -r '.port')
+                dest_type=$(echo "$decoded" | jq -r '.type' 2>/dev/null)
+                dest_addr=$(echo "$decoded" | jq -r '.addr' 2>/dev/null)
+                dest_port=$(echo "$decoded" | jq -r '.port' 2>/dev/null)
                 
                 if [ "$dest_type" == "vless" ]; then
                     local uuid=$(echo "$decoded" | jq -r '.uuid')
                     outbound_json=$(jq -n --arg s "$dest_addr" --arg p "$dest_port" --arg u "$uuid" \
-                        '{"type":"vless","server":$s,"server_port":($p|tonumber),"uuid":$u,"packet_encoding":"xudp","tls":{"enabled":false}}')
+                        '{"type":"vless","server":$s,"server_port":($p|tonumber),"uuid":$u,"packet_encoding":"xudp","tls":{"enabled":false}}' 2>/dev/null)
                 elif [ "$dest_type" == "shadowsocks" ]; then
                     local method=$(echo "$decoded" | jq -r '.method')
                     local password=$(echo "$decoded" | jq -r '.password')
                     outbound_json=$(jq -n --arg s "$dest_addr" --arg p "$dest_port" --arg m "$method" --arg pw "$password" \
-                        '{"type":"shadowsocks","server":$s,"server_port":($p|tonumber),"method":$m,"password":$pw}')
-                else
-                    _error "不支持的 Token 协议类型: $dest_type"
-                    return 1
+                        '{"type":"shadowsocks","server":$s,"server_port":($p|tonumber),"method":$m,"password":$pw}' 2>/dev/null)
                 fi
                 
-                # Token 模式已经构造好，直接返回
-                echo "$outbound_json|$dest_type|$dest_addr|$dest_port"
-                return 0
+                if [ -n "$outbound_json" ] && [ "$outbound_json" != "null" ]; then
+                    echo "$outbound_json|$dest_type|$dest_addr|$dest_port"
+                    return 0
+                fi
             fi
         fi
     fi
@@ -619,6 +619,7 @@ _landing_config() {
     if [ -z "$nodes" ]; then
         _error "未找到符合要求的落地节点协议。"
         _warn "要求: 本机已创建 VLESS-TCP 或特定 Shadowsocks 节点。"
+        _warn "如果您刚安装脚本，请先去主菜单选择 [1] 添加节点，协议选 [9] VLESS(TCP) 或 [8] Shadowsocks。"
         _warn "当前配置文件路径: $MAIN_CONFIG_FILE"
         return
     fi
