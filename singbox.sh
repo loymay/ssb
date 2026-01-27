@@ -3841,7 +3841,11 @@ _main_menu() {
         echo -e "  ${CYAN}【配置与更新】${NC}"
         echo -e "   ${GREEN}[12]${NC} 检查配置文件     ${GREEN}[13]${NC} 更新脚本"
         echo -e "   ${GREEN}[14]${NC} 更新核心         ${RED}[15]${NC} 卸载脚本"
-        echo -e "   ${GREEN}[16]${NC} 进阶功能 (中转)"
+        echo ""
+
+        # 进阶功能
+        echo -e "  ${CYAN}【进阶功能】${NC}"
+        echo -e "   ${GREEN}[22]${NC} 节点中转"
         echo ""
         
         
@@ -3849,7 +3853,7 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-15]: " choice
+        read -p "  请输入选项 [0-22]: " choice
 
         case $choice in
             1) _show_add_node_menu ;;
@@ -3867,7 +3871,7 @@ _main_menu() {
             13) _update_script ;;
             14) _update_singbox_core ;;
             15) _uninstall ;; 
-            16) _advanced_features ;;
+            22) _advanced_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac

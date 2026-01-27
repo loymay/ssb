@@ -1524,6 +1524,9 @@ _advanced_menu() {
             0) exit 0 ;;
             *) echo "无效选择" ;;
         esac
+        
+        echo ""
+        read -n 1 -s -r -p "按任意键继续..."
     done
 }
 
