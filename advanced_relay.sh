@@ -316,13 +316,15 @@ _parse_vless_share_link() {
     local link="$1"
     
     # vless://UUID@SERVER:PORT?参数#名称
-    local uuid=$(echo "$link" | sed 's/vless:\/\/\([^@]*\)@.*/\1/')
-    local server=$(echo "$link" | sed 's/.*@\([^:]*\):.*/\1/')
-    local port=$(echo "$link" | sed 's/.*:\([0-9]*\)?.*/\1/' | cut -d'?' -f1)
+    local uuid=$(echo "$link" | sed -n 's/vless:\/\/\([^@]*\)@.*/\1/p')
+    local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
+    
+    # 支持 IPv6 地址 (带括号 [2001:...]:port)
+    local server=$(echo "$server_port" | rev | cut -d: -f2- | rev | tr -d '[]')
+    local port=$(echo "$server_port" | rev | cut -d: -f1 | rev)
     
     # 解析查询参数
-    local query=$(echo "$link" | grep -oP '\?.*?(?=#|$)' 2>/dev/null || echo "")
-    query=$(echo "$query" | sed 's/^?//')
+    local query=$(echo "$link" | grep -oP '\?\K[^#]*' 2>/dev/null || echo "")
     
     local security=$(echo "$query" | grep -oP 'security=\K[^&]*' 2>/dev/null || echo "none")
     local network=$(echo "$query" | grep -oP '(type|network)=\K[^&]*' 2>/dev/null || echo "tcp")
@@ -349,7 +351,7 @@ _parse_vless_share_link() {
             } else {
                 enabled: false
             } end)
-        }')
+        }' 2>/dev/null)
     
     echo "$outbound_json"
 }
@@ -616,8 +618,8 @@ _landing_config() {
 
     if [ -z "$nodes" ]; then
         _error "未找到符合要求的落地节点协议。"
-        _warn "仅支持: VLESS-TCP, Shadowsocks(aes-256-gcm / 2022-blake3-aes-128-gcm)"
-        _warn "请先去主菜单 [1) 添加节点] 创建上述类型的节点。"
+        _warn "要求: 本机已创建 VLESS-TCP 或特定 Shadowsocks 节点。"
+        _warn "当前配置文件路径: $MAIN_CONFIG_FILE"
         return
     fi
 
@@ -1552,7 +1554,8 @@ _advanced_menu() {
         esac
         
         echo ""
-        read -n 1 -s -r -p "按任意键继续..."
+        echo -e "${YELLOW}按任意键返回中转菜单...${NC}"
+        read -n 1 -s -r
     done
 }
 
