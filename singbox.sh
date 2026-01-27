@@ -3714,23 +3714,25 @@ _update_script() {
     fi
     
     # 更新子脚本 (advanced_relay.sh)
-    _info "正在更新子脚本 (advanced_relay.sh)..."
     local relay_script_name="advanced_relay.sh"
     local relay_script_path="$(dirname "$SELF_SCRIPT_PATH")/${relay_script_name}"
     local relay_update_url="$(dirname "$SCRIPT_UPDATE_URL")/${relay_script_name}"
     
-    if wget -qO "${relay_script_path}.tmp" "$relay_update_url"; then
-        if [ -s "${relay_script_path}.tmp" ]; then
-            mv "${relay_script_path}.tmp" "$relay_script_path"
-            chmod +x "$relay_script_path"
-            _success "子脚本 (advanced_relay.sh) 更新成功！"
+    if [ -f "$relay_script_path" ]; then
+        _info "正在更新子脚本 (advanced_relay.sh)..."
+        if wget -qO "${relay_script_path}.tmp" "$relay_update_url"; then
+            if [ -s "${relay_script_path}.tmp" ]; then
+                mv "${relay_script_path}.tmp" "$relay_script_path"
+                chmod +x "$relay_script_path"
+                _success "子脚本 (advanced_relay.sh) 更新成功！"
+            else
+                 _warning "子脚本下载为空，跳过更新。"
+                 rm -f "${relay_script_path}.tmp"
+            fi
         else
-             _warning "子脚本下载为空，跳过更新。"
-             rm -f "${relay_script_path}.tmp"
+            _warning "子脚本下载失败，可能是网络问题或源文件不存在。"
+            rm -f "${relay_script_path}.tmp"
         fi
-    else
-        _warning "子脚本下载失败，可能是网络问题或源文件不存在。"
-        rm -f "${relay_script_path}.tmp"
     fi
 
     _success "脚本更新完成！"
