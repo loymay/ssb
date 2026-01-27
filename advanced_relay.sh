@@ -26,6 +26,11 @@ _info() { echo -e "${CYAN}[信息] $1${NC}"; }
 _success() { echo -e "${GREEN}[成功] $1${NC}"; }
 _warn() { echo -e "${YELLOW}[注意] $1${NC}"; }
 _error() { echo -e "${RED}[错误] $1${NC}"; }
+_pause() { 
+    echo ""
+    read -n 1 -s -r -p "按任意键继续..."
+    echo ""
+}
 
 # 日志记录函数
 _log_operation() {
@@ -164,8 +169,18 @@ _parse_vless_share_link() {
     local link="$1"
     local uuid=$(echo "$link" | sed -n 's/vless:\/\/\([^@]*\)@.*/\1/p')
     local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
-    local server=$(echo "$server_port" | rev | cut -d: -f2- | rev | tr -d '[]')
-    local port=$(echo "$server_port" | rev | cut -d: -f1 | rev)
+    local server=""
+    local port=""
+    
+    if [[ "$server_port" == "["* ]]; then
+        # IPv6
+        server=$(echo "$server_port" | sed -n 's/\[\(.*\)\]:.*/\1/p')
+        port=$(echo "$server_port" | sed -n 's/.*\]:\(.*\)/\1/p')
+    else
+        # IPv4 or Domain
+        server=$(echo "$server_port" | cut -d: -f1)
+        port=$(echo "$server_port" | cut -d: -f2)
+    fi
     local query=$(echo "$link" | grep -oP '\?\K[^#]*' 2>/dev/null || echo "")
     
     local security=$(echo "$query" | grep -oP 'security=\K[^&]*' 2>/dev/null || echo "none")
@@ -176,14 +191,20 @@ _parse_vless_share_link() {
     # 标准 sing-box outbound 不需要太复杂的 reality 客户端配置，除非我们要偷取它的 fingerprints
     # 作为中转出口，最重要的是地址、端口、UUID和传输层
     
+    local flow=$(echo "$query" | grep -oP 'flow=\K[^&]*' 2>/dev/null || echo "")
+    local path=$(echo "$query" | grep -oP 'path=\K[^&]*' 2>/dev/null || echo "/")
+    local serviceName=$(echo "$query" | grep -oP 'serviceName=\K[^&]*' 2>/dev/null || echo "")
+
     jq -n \
         --arg s "$server" --arg p "$port" --arg u "$uuid" \
         --arg sec "$security" --arg net "$network" --arg sni "$sni" \
+        --arg flow "$flow" --arg path "$path" --arg snm "$serviceName" \
         '{
             type: "vless",
             server: $s,
             server_port: ($p|tonumber),
             uuid: $u,
+            flow: $flow,
             network: $net,
             packet_encoding: "xudp",
             tls: (if ($sec == "tls" or $sec == "reality") then {
@@ -193,7 +214,12 @@ _parse_vless_share_link() {
             } else {
                 enabled: false
             } end)
-        }'
+        } | 
+        if ($net == "ws") then 
+            .transport = {type: "ws", path: $path, headers: {Host: $sni}} 
+        elif ($net == "grpc") then 
+            .transport = {type: "grpc", service_name: $snm}
+        else . end'
 }
 
 _parse_vmess_share_link() {
@@ -215,7 +241,12 @@ _parse_vmess_share_link() {
             } else {
                 enabled: false
             } end)
-        }'
+        } |
+        if (.network == "ws") then
+            .transport = {type: "ws", path: ($data.path // "/"), headers: {Host: ($data.host // "")}}
+        elif (.network == "grpc") then
+            .transport = {type: "grpc", service_name: ($data.path // "")}
+        else . end'
 }
 
 _parse_shadowsocks_share_link() {
@@ -331,13 +362,19 @@ _parse_hysteria2_share_link() {
 }
 
 _parse_input_smart() {
-    local input=$(echo "$1" | tr -d '[:space:]')
+    # 移除首尾空格和可能的换行符
+    local input=$(echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r\n')
     local outbound_json=""
     local dest_type=""
     
-    # 1. 尝试 Base64 解码
+    # 1. 尝试 Base64 解码 (处理可能缺少的填充)
     if [[ "$input" =~ ^[A-Za-z0-9+/_-]+=*$ ]] && [[ ${#input} -gt 20 ]]; then
-        local decoded=$(echo "$input" | tr '_-' '/+' | base64 -d 2>/dev/null)
+        local b64_input="$input"
+        local len=$(( ${#b64_input} % 4 ))
+        [[ $len -eq 2 ]] && b64_input="${b64_input}=="
+        [[ $len -eq 3 ]] && b64_input="${b64_input}="
+        
+        local decoded=$(echo "$b64_input" | tr '_-' '/+' | base64 -d 2>/dev/null)
         if [ -n "$decoded" ]; then
              # 如果解码后包含 type 字段，假设是 JSON Token
              if echo "$decoded" | grep -q "\"type\":"; then
@@ -419,6 +456,7 @@ _landing_config() {
     local nodes=$(jq -c '.inbounds[] | select(.type=="vless" or .type=="shadowsocks")' "$MAIN_CONFIG_FILE")
     if [ -z "$nodes" ]; then
         _error "未找到 VLESS 或 Shadowsocks 节点。"
+        _pause
         return
     fi
     
@@ -431,11 +469,17 @@ _landing_config() {
         echo -e "${GREEN}$i)${NC} $tag ($type : $port)"
         node_list+=("$node")
         ((i++))
-    done <<< "$nodes"
+    done <<EOF
+$(echo "$nodes")
+EOF
     
     echo "0) 返回"
     read -p "请选择落地节点: " choice
-    if [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -ge "$i" ]; then return; fi
+    if [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -ge "$i" ]; then 
+        _warn "已取消或输入无效"
+        _pause
+        return 
+    fi
     
     local selected=${node_list[$((choice-1))]}
     local port=$(echo "$selected" | jq -r '.listen_port')
@@ -477,14 +521,18 @@ _relay_config() {
     echo -e "${YELLOW}请粘贴内容 (完成后按回车):${NC}"
     read -r input
     
-    if [ -z "$input" ]; then _error "输入为空"; return; fi
+    if [ -z "$input" ]; then 
+        _error "输入为空"
+        _pause
+        return 
+    fi
     
     _info "正在解析..."
     local result=$(_parse_input_smart "$input")
     
     if [ $? -ne 0 ]; then
         _error "无法解析输入内容！请检查格式。"
-        read -p "按回车继续..."
+        _pause
         return
     fi
     
@@ -520,7 +568,7 @@ _finalize_relay_setup() {
         2) relay_type="hysteria2" ;;
         3) relay_type="tuic" ;;
         4) relay_type="anytls" ;;
-        *) _error "无效选择"; return ;;
+        *) _error "无效选择"; _pause; return ;;
     esac
     
     read -p "请输入本机监听端口 (留空随机): " listen_port
@@ -629,6 +677,7 @@ _finalize_relay_setup() {
         _error "服务重启失败，即将回滚..."
         mv "${RELAY_CONFIG_FILE}.bak" "$RELAY_CONFIG_FILE"
         systemctl restart sing-box
+        _pause
         return
     fi
     
@@ -657,7 +706,7 @@ _finalize_relay_setup() {
         _add_node_to_relay_yaml "$proxy_json"
     fi
     
-    read -p "按回车完成..."
+    _pause
 }
 
 # 4. 查看/删除 中转
