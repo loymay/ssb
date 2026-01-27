@@ -1421,6 +1421,13 @@ _uninstall() {
 
     # 删除脚本自身 (使用启动时获取的绝对路径)
     if [ -f "$SELF_SCRIPT_PATH" ]; then
+        # 尝试删除同一目录下的 advanced_relay.sh
+        local relay_script="$(dirname "$SELF_SCRIPT_PATH")/advanced_relay.sh"
+        if [ -f "$relay_script" ]; then
+            rm -f "$relay_script"
+            _info "已删除子脚本: $relay_script"
+        fi
+        
         rm -f "$SELF_SCRIPT_PATH"
     fi
     
@@ -3707,6 +3714,25 @@ _update_script() {
     fi
     
     # 更新子脚本 (advanced_relay.sh)
+    _info "正在更新子脚本 (advanced_relay.sh)..."
+    local relay_script_name="advanced_relay.sh"
+    local relay_script_path="$(dirname "$SELF_SCRIPT_PATH")/${relay_script_name}"
+    local relay_update_url="$(dirname "$SCRIPT_UPDATE_URL")/${relay_script_name}"
+    
+    if wget -qO "${relay_script_path}.tmp" "$relay_update_url"; then
+        if [ -s "${relay_script_path}.tmp" ]; then
+            mv "${relay_script_path}.tmp" "$relay_script_path"
+            chmod +x "$relay_script_path"
+            _success "子脚本 (advanced_relay.sh) 更新成功！"
+        else
+             _warning "子脚本下载为空，跳过更新。"
+             rm -f "${relay_script_path}.tmp"
+        fi
+    else
+        _warning "子脚本下载失败，可能是网络问题或源文件不存在。"
+        rm -f "${relay_script_path}.tmp"
+    fi
+
     _success "脚本更新完成！"
     _info "请重新运行脚本以加载新版本："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
