@@ -38,9 +38,19 @@ _log_operation() {
 
 # 获取公网IP
 _get_public_ip() {
-    local ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
-    if [ -z "$ip" ]; then
-        ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s6 --max-time 2 ipinfo.io/ip 2>/dev/null)
+    # 优先使用 curl，timeout 命令可能缺失
+    local ip=""
+    if command -v timeout &>/dev/null; then
+        ip=$(timeout 3 curl -s4 --max-time 3 icanhazip.com 2>/dev/null || timeout 3 curl -s4 --max-time 3 ipinfo.io/ip 2>/dev/null)
+        if [ -z "$ip" ]; then
+            ip=$(timeout 3 curl -s6 --max-time 3 icanhazip.com 2>/dev/null || timeout 3 curl -s6 --max-time 3 ipinfo.io/ip 2>/dev/null)
+        fi
+    else
+        # 不带 timeout 命令的 fallback
+        ip=$(curl -s4 --max-time 3 icanhazip.com 2>/dev/null || curl -s4 --max-time 3 ipinfo.io/ip 2>/dev/null)
+        if [ -z "$ip" ]; then
+            ip=$(curl -s6 --max-time 3 icanhazip.com 2>/dev/null || curl -s6 --max-time 3 ipinfo.io/ip 2>/dev/null)
+        fi
     fi
     if [ -z "$ip" ]; then
         _warn "无法自动获取公网IP"
@@ -174,6 +184,7 @@ EOF
 _check_deps() {
     if ! command -v jq &>/dev/null; then
         _error "缺少 'jq' 工具，请先安装。"
+        read -p "按任意键退出..."
         exit 1
     fi
     
@@ -978,6 +989,7 @@ _finalize_relay_setup() {
 }
 
 # --- 2. 中转机配置 (智能导入：Token 或分享链接) ---
+# --- 2. 中转机配置 (智能导入：Token 或分享链接) ---
 _relay_config() {
     echo "================================================"
     echo "     配置为 [中转机] - 智能识别导入            "
@@ -987,27 +999,41 @@ _relay_config() {
     echo "  ✓ VLESS/VMess/Shadowsocks/Trojan/Hysteria2 分享链接"
     echo "  ✓ Base64 编码的分享链接"
     echo ""
-    echo -e "${YELLOW}请粘贴您的导入内容:${NC}"
-    read -r input
+    echo -e "${YELLOW}请粘贴您的导入内容 (粘贴后按回车):${NC}"
+    
+    # 使用 -e 支持 readline 编辑
+    read -r -e input
+    
+    # 清理输入中的空白字符 (空格、换行、回车)
+    input=$(echo "$input" | tr -d '[:space:]')
     
     if [ -z "$input" ]; then 
         _error "输入为空。"
         return
     fi
     
+    _info "正在解析输入..."
+    
     # 调用智能解析函数
     local parsed_result=$(_parse_landing_input "$input")
     
     if [ $? -ne 0 ] || [ -z "$parsed_result" ]; then
-        _error "解析失败！请检查输入格式"
+        _error "解析失败！无法识别输入格式。"
+        _warn "请检查是否完整复制了链接或 Token。"
         return
     fi
     
     # 分割结果: outbound_json|dest_type|dest_addr|dest_port
     IFS='|' read -r outbound_json dest_type dest_addr dest_port <<< "$parsed_result"
     
-    if [ -z "$outbound_json" ] || [ -z "$dest_type" ]; then
-        _error "解析结果无效"
+    # 再次检查解析出的 JSON 是否有效
+    if [ -z "$outbound_json" ] || ! echo "$outbound_json" | jq . >/dev/null 2>&1; then
+        _error "解析结果无效 (JSON 格式错误)"
+        return
+    fi
+    
+    if [ -z "$dest_type" ]; then
+        _error "无法确定协议类型"
         return
     fi
     
