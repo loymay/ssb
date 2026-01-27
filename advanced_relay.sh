@@ -32,6 +32,37 @@ _pause() {
     echo ""
 }
 
+# 检测初始化系统
+_detect_init_system() {
+    if [ -d "/run/systemd/system" ] || command -v systemctl &>/dev/null; then
+        INIT_SYSTEM="systemd"
+    elif [ -f "/sbin/openrc-run" ] || command -v rc-service &>/dev/null; then
+        INIT_SYSTEM="openrc"
+    else
+        INIT_SYSTEM="unknown"
+    fi
+}
+
+# 服务管理函数
+_manage_service() {
+    local action="$1"
+    local service_name="sing-box"
+    
+    [ -z "$INIT_SYSTEM" ] && _detect_init_system
+    
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl "$action" "$service_name"
+            ;;
+        openrc)
+            rc-service "$service_name" "$action"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # 日志记录函数
 _log_operation() {
     local operation="$1"
@@ -671,12 +702,12 @@ _finalize_relay_setup() {
     jq ".route.rules += [{\"inbound\":\"$inbound_tag\",\"outbound\":\"$outbound_tag\"}]" "$RELAY_CONFIG_FILE" > "$tmp_file" && mv "$tmp_file" "$RELAY_CONFIG_FILE"
 
     # 重启服务
-    if systemctl restart sing-box; then
+    if _manage_service restart; then
         _success "服务重启成功！中转已生效。"
     else
         _error "服务重启失败，即将回滚..."
         mv "${RELAY_CONFIG_FILE}.bak" "$RELAY_CONFIG_FILE"
-        systemctl restart sing-box
+        _manage_service restart
         _pause
         return
     fi
@@ -773,9 +804,9 @@ _manage_relays() {
             local tmp_l="${link_file}.tmp"
             jq "del(.[\"$selected_key\"])" "$link_file" > "$tmp_l" && mv "$tmp_l" "$link_file"
             
-            systemctl restart sing-box
+            _manage_service restart
             _success "删除成功"
-            read -p "按回车继续..."
+            _pause
         fi
     fi
 }
