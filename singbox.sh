@@ -4728,6 +4728,9 @@ _create_shortcut() {
 # --- 脚本入口 ---
 
 main() {
+    _detect_init_system
+    _check_root
+    
     # _install_dependencies 函数内部有 "command -v" 检查，所以重复运行是安全的
     _info "正在检查核心依赖 (yq)..."
     _install_dependencies
@@ -4810,17 +4813,24 @@ main() {
     _main_menu
 }
 
-# 解析命令行参数
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -q|--quick-deploy)
-            QUICK_DEPLOY_MODE=true
-            shift
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
-
-main
+# 解析命令行参数并运行
+case "$1" in
+    "keepalive")
+        _detect_init_system
+        _argo_keepalive
+        ;;
+    *)
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -q|--quick-deploy)
+                    QUICK_DEPLOY_MODE=true
+                    shift
+                    ;;
+                *)
+                    shift
+                    ;;
+            esac
+        done
+        main
+        ;;
+esac
