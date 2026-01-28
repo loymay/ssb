@@ -202,36 +202,23 @@ _check_deps() {
 #  解析函数集
 # ==============================================
 
-_parse_vless_share_link() {
+_parse_vless_reality() {
     local link="$1"
-    # vless://uuid@server:port?param1=value1&param2=value2#name
+    # 复用主脚本逻辑解析 Reality/TLS 链接
     local uuid=$(echo "$link" | sed -n 's|vless://\([^@]*\)@.*|\1|p')
     local server_port=$(echo "$link" | sed -n 's|vless://[^@]*@\([^?#/]*\).*|\1|p')
+    local server=$(echo "$server_port" | cut -d: -f1)
+    local port=$(echo "$server_port" | cut -d: -f2)
     
-    local server=""
-    local port=""
-    if [[ "$server_port" == "["* ]]; then
-        server=$(echo "$server_port" | sed -n 's|\[\(.*\)\]:.*|\1|p')
-        port=$(echo "$server_port" | sed -n 's|.*\]:\([0-9]*\).*|\1|p')
-    else
-        server=$(echo "$server_port" | cut -d: -f1)
-        port=$(echo "$server_port" | cut -d: -f2)
-    fi
-    
-    [[ -z "$server" || -z "$port" ]] && return 1
-
     local params=""
     [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
     
-    local flow=""
-    local security=""
+    local flow="xtls-rprx-vision"
+    local security="reality"
     local sni=""
     local pbk=""
     local sid=""
     local fp="chrome"
-    local network="tcp"
-    local path="/"
-    local serviceName=""
 
     if [ -n "$params" ]; then
         IFS='&' read -ra PARAM_ARRAY <<< "$params"
@@ -245,9 +232,6 @@ _parse_vless_share_link() {
                 "pbk") pbk="$value" ;;
                 "sid") sid="$value" ;;
                 "fp") fp="$value" ;;
-                "type"|"network") network="$value" ;;
-                "path") path=$(echo "$value" | sed 's/%2F/\//g') ;;
-                "serviceName") serviceName="$value" ;;
             esac
         done
     fi
@@ -257,9 +241,7 @@ _parse_vless_share_link() {
     jq -c -n \
         --arg server "$server" --arg port "$port" --arg uuid "$uuid" \
         --arg flow "$flow" --arg sni "$sni" --arg pbk "$pbk" \
-        --arg sid "$sid" --arg fp "$fp" --arg net "$network" \
-        --arg path "$path" --arg snm "$serviceName" \
-        --arg security "$security" \
+        --arg sid "$sid" --arg fp "$fp" --arg security "$security" \
         '{
             type: "vless",
             server: $server,
@@ -267,20 +249,29 @@ _parse_vless_share_link() {
             uuid: $uuid,
             flow: $flow,
             packet_encoding: "xudp",
-            tls: (if ($security == "reality" or $security == "tls") then {
+            tls: {
                 enabled: true,
                 server_name: $sni,
                 utls: { enabled: true, fingerprint: $fp }
-            } else { enabled: false } end)
+            }
         } |
         if ($security == "reality") then 
             .tls.reality = { enabled: true, public_key: $pbk, short_id: $sid }
-        else . end |
-        if ($net == "ws") then 
-            .transport = {type: "ws", path: $path, headers: {Host: $sni}} 
-        elif ($net == "grpc") then 
-            .transport = {type: "grpc", service_name: $snm}
         else . end'
+}
+
+_parse_vless_plain() {
+    local link="$1"
+    # 专门处理裸 VLESS TCP，模拟 Token 模式
+    local uuid=$(echo "$link" | sed -n 's|vless://\([^@]*\)@.*|\1|p')
+    local server_port=$(echo "$link" | sed -n 's|vless://[^@]*@\([^?#/]*\).*|\1|p')
+    local server=$(echo "$server_port" | cut -d: -f1)
+    local port=$(echo "$server_port" | cut -d: -f2)
+    
+    [[ -z "$server" || -z "$port" ]] && return 1
+
+    jq -c -n --arg s "$server" --arg p "$port" --arg u "$uuid" \
+        '{"type":"vless","server":$s,"server_port":($p|tonumber),"uuid":$u,"packet_encoding":"xudp","tls":{"enabled":false}}'
 }
 
 _parse_vmess_share_link() {
@@ -575,6 +566,14 @@ _parse_input_smart() {
     elif [[ "$input" == tuic://* ]]; then
         outbound_json=$(_parse_tuic_link "$input")
         dest_type="tuic"
+    elif [[ "$input" == vless://* ]]; then
+        # 智能判别: 如果含 reality 或 tls 则用高级解析，否则裸解析
+        if [[ "$input" == *"reality"* || "$input" == *"tls"* ]]; then
+            outbound_json=$(_parse_vless_reality "$input")
+        else
+            outbound_json=$(_parse_vless_plain "$input")
+        fi
+        dest_type="vless"
     fi
 
     if [ -n "$outbound_json" ] && [ "$outbound_json" != "null" ]; then
@@ -659,48 +658,82 @@ EOF
 # 2. 中转机配置 (智能导入)
 _relay_config() {
     echo -e "================================================"
-    echo -e "          配置中转规则 (智能导入)"
+    echo -e "          配置中转规则 (手动选择导入)"
     echo -e "================================================"
-    echo -e "支持格式: "
-    echo -e " 1. Base64 Token (来自 落地机配置)"
-    echo -e " 2. 分享链接 (vless://, vmess://, ss://, trojan://, hysteria2://)"
-    echo -e " 3. Base64 编码的分享链接"
-    echo "----------------------------------------"
-    echo -e "${YELLOW}请粘贴内容 (完成后按回车):${NC}"
-    read -r input
+    echo -e "请选择导入的 [落地节点] 类型:"
+    echo -e " 1) VLESS-Reality (包含Reality/TLS加密)"
+    echo -e " 2) Hysteria2"
+    echo -e " 3) TUIC"
+    echo -e " 4) Shadowsocks"
+    echo -e " 5) VLESS-TCP (裸协议/Token)"
+    echo -e " 6) 智能导入 (自动识别链接/Token)"
+    echo " 0) 返回"
+    read -p "选择 [0-6]: " import_choice
+
+    if [[ "$import_choice" == "0" ]]; then return; fi
+
+    local input=""
+    local outbound_json=""
+    local dest_type=""
+
+    case "$import_choice" in
+        1)
+            read -p "请粘贴 VLESS (Reality/TLS) 分享链接: " input
+            outbound_json=$(_parse_vless_reality "$input")
+            dest_type="vless"
+            ;;
+        2)
+            read -p "请粘贴 Hysteria2 分享链接: " input
+            outbound_json=$(_parse_hysteria2_share_link "$input")
+            dest_type="hysteria2"
+            ;;
+        3)
+            read -p "请粘贴 TUIC 分享链接: " input
+            outbound_json=$(_parse_tuic_link "$input")
+            dest_type="tuic"
+            ;;
+        4)
+            read -p "请粘贴 Shadowsocks 分享链接: " input
+            outbound_json=$(_parse_shadowsocks_share_link "$input")
+            dest_type="shadowsocks"
+            ;;
+        5)
+            # 处理 Token 或者是 裸链接
+            read -p "请粘贴 Token 或 VLESS-TCP 裸链接: " input
+            if [[ "$input" == vless://* ]]; then
+                outbound_json=$(_parse_vless_plain "$input")
+            else
+                # 尝试作为 Token 解析
+                local result=$(_parse_input_smart "$input")
+                outbound_json=$(echo "$result" | cut -d'|' -f1)
+            fi
+            dest_type="vless"
+            ;;
+        6)
+            read -p "请粘贴链接或 Token: " input
+            local result=$(_parse_input_smart "$input")
+            outbound_json=$(echo "$result" | cut -d'|' -f1)
+            dest_type=$(echo "$result" | cut -d'|' -f2)
+            ;;
+        *) _error "无效选项"; return ;;
+    esac
     
-    if [ -z "$input" ]; then 
-        _error "输入为空"
-        _pause
-        return 
-    fi
-    
-    _info "正在解析..."
-    local result
-    result=$(_parse_input_smart "$input")
-    local status=$?
-    
-    if [ $status -ne 0 ] || [ -z "$result" ]; then
-        _error "无法解析输入内容！请检查是否为有效的分享链接或 Token。"
+    if [ -z "$outbound_json" ] || [ "$outbound_json" == "null" ]; then
+        _error "解析失败：未能提取到有效的配置信息。"
         _pause
         return
     fi
     
-    # 解析结果格式: outbound_json|type
-    local outbound_json=$(echo "$result" | cut -d'|' -f1)
-    local dest_type=$(echo "$result" | cut -d'|' -f2)
-    
-    local dest_addr=$(echo "$outbound_json" | jq -r .server 2>/dev/null)
-    local dest_port=$(echo "$outbound_json" | jq -r .server_port 2>/dev/null)
+    local dest_addr=$(echo "$outbound_json" | jq -r .server)
+    local dest_port=$(echo "$outbound_json" | jq -r .server_port)
     
     if [ -z "$dest_addr" ] || [ "$dest_addr" == "null" ]; then
-        _error "解析失败：未能提取到有效的服务器地址。"
+        _error "解析失败：服务器地址为空。"
         _pause
         return
     fi
 
     _success "解析成功: ${dest_addr}:${dest_port}"
-    
     _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
 }
 
@@ -716,15 +749,13 @@ _finalize_relay_setup() {
     echo -e " 1) VLESS-Reality (推荐, 稳定)"
     echo -e " 2) Hysteria2 (UDP, 速度快)"
     echo -e " 3) TUIC (UDP)"
-    echo -e " 4) AnyTLS (TCP)"
-    read -p "选择 [1-4]: " choice
+    read -p "选择 [1-3]: " choice
     
     local relay_type=""
     case "$choice" in
         1) relay_type="vless-reality" ;;
         2) relay_type="hysteria2" ;;
         3) relay_type="tuic" ;;
-        4) relay_type="anytls" ;;
         *) _error "无效选择"; _pause; return ;;
     esac
     
@@ -770,7 +801,8 @@ _finalize_relay_setup() {
                 tls: {
                     enabled: true, server_name: $sn,
                     reality: { enabled: true, handshake: {server: $sn, server_port: 443}, private_key: $pk, short_id: [$sid] }
-                }
+                },
+                sniff: true, sniff_override_destination: true
             }')
          link="vless://${uuid}@${server_ip}:${listen_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#${node_name}"
          
@@ -782,7 +814,8 @@ _finalize_relay_setup() {
             '{
                 type: "hysteria2", tag: $t, listen: "::", listen_port: ($p|tonumber),
                 users: [{password: $pw}],
-                tls: { enabled: true, server_name: $sn, alpn: ["h3"], certificate_path: $c, key_path: $k }
+                tls: { enabled: true, server_name: $sn, alpn: ["h3"], certificate_path: $c, key_path: $k },
+                sniff: true, sniff_override_destination: true
             }')
         link="hysteria2://${pw}@${server_ip}:${listen_port}?sni=${sni}&insecure=1#${node_name}"
     
@@ -795,7 +828,8 @@ _finalize_relay_setup() {
             '{
                 type: "tuic", tag: $t, listen: "::", listen_port: ($p|tonumber),
                 users: [{uuid: $u, password: $pw}], congestion_control: "bbr",
-                tls: { enabled: true, server_name: $sn, alpn: ["h3"], certificate_path: $c, key_path: $k }
+                tls: { enabled: true, server_name: $sn, alpn: ["h3"], certificate_path: $c, key_path: $k },
+                sniff: true, sniff_override_destination: true
             }')
          link="tuic://${uuid}:${pw}@${server_ip}:${listen_port}?sni=${sni}&alpn=h3&congestion_control=bbr&allow_insecure=1#${node_name}"
     
