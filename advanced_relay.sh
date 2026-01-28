@@ -513,12 +513,12 @@ _parse_tuic_link() {
 }
 
 _parse_input_smart() {
-    # 移除首尾空格和可能的换行符
-    local input=$(echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r\n')
+    # 移除首尾空格和可能的换行符，处理剪贴板污染
+    local input=$(echo "$1" | xargs 2>/dev/null | tr -d '\r\n')
     local outbound_json=""
     local dest_type=""
     
-    # 1. 尝试 Base64 解码 (处理可能缺少的填充)
+    # 1. 尝试 Token 解码 (Base64 JSON)
     if [[ "$input" =~ ^[A-Za-z0-9+/_-]+=*$ ]] && [[ ${#input} -gt 20 ]]; then
         local b64_input="$input"
         local len=$(( ${#b64_input} % 4 ))
@@ -526,45 +526,40 @@ _parse_input_smart() {
         [[ $len -eq 3 ]] && b64_input="${b64_input}="
         
         local decoded=$(echo "$b64_input" | tr '_-' '/+' | base64 -d 2>/dev/null)
-        if [ -n "$decoded" ]; then
-             # 如果解码后包含 type 字段，假设是 JSON Token
-             if echo "$decoded" | grep -q "\"type\":"; then
-                 local j_type=$(echo "$decoded" | jq -r .type 2>/dev/null)
-                 # 兼容旧版 Token 生成格式
-                 if [[ "$j_type" == "vless" ]]; then
-                     local addr=$(echo "$decoded" | jq -r .addr)
-                     local port=$(echo "$decoded" | jq -r .port)
-                     local uuid=$(echo "$decoded" | jq -r .uuid)
-                     outbound_json=$(jq -n --arg s "$addr" --arg p "$port" --arg u "$uuid" \
-                        '{"type":"vless","server":$s,"server_port":($p|tonumber),"uuid":$u,"packet_encoding":"xudp","tls":{"enabled":false}}')
-                     dest_type="vless"
-                 elif [[ "$j_type" == "shadowsocks" ]]; then
-                     local addr=$(echo "$decoded" | jq -r .addr)
-                     local port=$(echo "$decoded" | jq -r .port)
-                     local method=$(echo "$decoded" | jq -r .method)
-                     local pw=$(echo "$decoded" | jq -r .password)
-                     outbound_json=$(jq -n --arg s "$addr" --arg p "$port" --arg m "$method" --arg pw "$pw" \
-                        '{"type":"shadowsocks","server":$s,"server_port":($p|tonumber),"method":$m,"password":$pw}')
-                     dest_type="shadowsocks"
-                 fi
-                 
-                 if [ -n "$outbound_json" ]; then
-                     echo "$outbound_json|$dest_type"
-                     return 0
-                 fi
+        if [ -n "$decoded" ] && echo "$decoded" | grep -q "\"type\":"; then
+             local j_type=$(echo "$decoded" | jq -r .type 2>/dev/null)
+             if [[ "$j_type" == "vless" ]]; then
+                 local addr=$(echo "$decoded" | jq -r .addr)
+                 local port=$(echo "$decoded" | jq -r .port)
+                 local uuid=$(echo "$decoded" | jq -r .uuid)
+                 outbound_json=$(jq -n --arg s "$addr" --arg p "$port" --arg u "$uuid" \
+                    '{"type":"vless","server":$s,"server_port":($p|tonumber),"uuid":$u,"packet_encoding":"xudp","tls":{"enabled":false}}')
+                 dest_type="vless"
+             elif [[ "$j_type" == "shadowsocks" ]]; then
+                 local addr=$(echo "$decoded" | jq -r .addr)
+                 local port=$(echo "$decoded" | jq -r .port)
+                 local method=$(echo "$decoded" | jq -r .method)
+                 local pw=$(echo "$decoded" | jq -r .password)
+                 outbound_json=$(jq -n --arg s "$addr" --arg p "$port" --arg m "$method" --arg pw "$pw" \
+                    '{"type":"shadowsocks","server":$s,"server_port":($p|tonumber),"method":$m,"password":$pw,"packet_encoding":"xudp"}')
+                 dest_type="shadowsocks"
              fi
              
-             # 如果解码后是链接
-             if [[ "$decoded" =~ ^(vless|vmess|ss|trojan|hysteria2|hy2):// ]]; then
-                 input="$decoded"
-                 _info "Base64 解码成功: 下一步解析 $input"
+             if [ -n "$outbound_json" ]; then
+                 echo "$outbound_json|$dest_type"
+                 return 0
              fi
         fi
     fi
     
     # 2. 链接解析
     if [[ "$input" == vless://* ]]; then
-        outbound_json=$(_parse_vless_share_link "$input")
+        # 智能判别: 如果含 reality 或 tls 则用高级解析，否则裸解析
+        if [[ "$input" == *"reality"* || "$input" == *"tls"* ]]; then
+            outbound_json=$(_parse_vless_reality "$input")
+        else
+            outbound_json=$(_parse_vless_plain "$input")
+        fi
         dest_type="vless"
     elif [[ "$input" == vmess://* ]]; then
         outbound_json=$(_parse_vmess_share_link "$input")
@@ -581,14 +576,6 @@ _parse_input_smart() {
     elif [[ "$input" == tuic://* ]]; then
         outbound_json=$(_parse_tuic_link "$input")
         dest_type="tuic"
-    elif [[ "$input" == vless://* ]]; then
-        # 智能判别: 如果含 reality 或 tls 则用高级解析，否则裸解析
-        if [[ "$input" == *"reality"* || "$input" == *"tls"* ]]; then
-            outbound_json=$(_parse_vless_reality "$input")
-        else
-            outbound_json=$(_parse_vless_plain "$input")
-        fi
-        dest_type="vless"
     fi
 
     if [ -n "$outbound_json" ] && [ "$outbound_json" != "null" ]; then
@@ -597,6 +584,7 @@ _parse_input_smart() {
     else
         return 1
     fi
+}
 }
 
 # ==============================================
@@ -673,71 +661,22 @@ EOF
 # 2. 中转机配置 (智能导入)
 _relay_config() {
     echo -e "================================================"
-    echo -e "          配置中转规则 (手动选择导入)"
+    echo -e "          配置中转规则 (智能导入模式)"
     echo -e "================================================"
-    echo -e "请选择导入的 [落地节点] 类型:"
-    echo -e " 1) VLESS-Reality (包含Reality/TLS加密)"
-    echo -e " 2) Hysteria2"
-    echo -e " 3) TUIC"
-    echo -e " 4) Shadowsocks"
-    echo -e " 5) VLESS-TCP (裸协议/Token)"
-    echo -e " 6) 智能导入 (自动识别链接/Token)"
-    echo " 0) 返回"
-    read -p "选择 [0-6]: " import_choice
-
-    if [[ "$import_choice" == "0" ]]; then return; fi
-
-    local input=""
-    local outbound_json=""
-    local dest_type=""
-
-    case "$import_choice" in
-        1)
-            read -p "请粘贴 VLESS (Reality/TLS) 分享链接: " input
-            outbound_json=$(_parse_vless_reality "$input")
-            dest_type="vless"
-            ;;
-        2)
-            read -p "请粘贴 Hysteria2 分享链接: " input
-            outbound_json=$(_parse_hysteria2_share_link "$input")
-            dest_type="hysteria2"
-            ;;
-        3)
-            read -p "请粘贴 TUIC 分享链接: " input
-            outbound_json=$(_parse_tuic_link "$input")
-            dest_type="tuic"
-            ;;
-        4)
-            read -p "请粘贴 Shadowsocks 分享链接: " input
-            outbound_json=$(_parse_shadowsocks_share_link "$input")
-            dest_type="shadowsocks"
-            ;;
-        5)
-            # 处理 Token 或者是 裸链接
-            read -p "请粘贴 Token 或 VLESS-TCP 裸链接: " input
-            if [[ "$input" == vless://* ]]; then
-                outbound_json=$(_parse_vless_plain "$input")
-            else
-                # 尝试作为 Token 解析
-                local result=$(_parse_input_smart "$input")
-                outbound_json=$(echo "$result" | cut -d'|' -f1)
-            fi
-            dest_type="vless"
-            ;;
-        6)
-            read -p "请粘贴链接或 Token: " input
-            local result=$(_parse_input_smart "$input")
-            outbound_json=$(echo "$result" | cut -d'|' -f1)
-            dest_type=$(echo "$result" | cut -d'|' -f2)
-            ;;
-        *) _error "无效选项"; return ;;
-    esac
+    echo -e "提示: 支持粘贴 SS/VLESS/VMess/Trojan/Hy2/TUIC 链接或 Token"
+    echo ""
+    read -p "请粘贴 [落地节点] 链接或 Token: " input
+    if [[ -z "$input" ]]; then return; fi
     
-    if [ -z "$outbound_json" ] || [ "$outbound_json" == "null" ]; then
+    local result=$(_parse_input_smart "$input")
+    if [[ $? -ne 0 || -z "$result" ]]; then
         _error "解析失败：未能提取到有效的配置信息。"
         _pause
         return
     fi
+    
+    local outbound_json=$(echo "$result" | cut -d'|' -f1)
+    local dest_type=$(echo "$result" | cut -d'|' -f2)
     
     local dest_addr=$(echo "$outbound_json" | jq -r .server)
     local dest_port=$(echo "$outbound_json" | jq -r .server_port)
@@ -751,6 +690,7 @@ _relay_config() {
     _success "解析成功: ${dest_addr}:${dest_port}"
     _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
 }
+
 
 # 3. 完成中转设置
 _finalize_relay_setup() {
