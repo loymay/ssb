@@ -124,7 +124,11 @@ _get_country_flag() {
         local char="${country_code:$i:1}"
         local ascii_val=$(printf "%d" "'$char")
         local emoji_val=$((ascii_val + 127397))
-        flag+=$(printf "\\U$(printf "%x" $emoji_val)")
+        # 使用更稳健的方式渲染 Emoji: 直接构造 UTF-8 字节序列或使用标准的 bash 4.2+ \U
+        # 对大多数现代 bash 环境，\U 是最稳健的
+        local hex=$(printf "%08x" $emoji_val)
+        local f=$(printf "\\U$hex" 2>/dev/null || echo -e "\\U$hex")
+        flag+="$f"
     done
     echo "$flag"
 }
@@ -198,38 +202,55 @@ _check_deps() {
 
 _parse_vless_share_link() {
     local link="$1"
+    
     local uuid=$(echo "$link" | sed -n 's/vless:\/\/\([^@]*\)@.*/\1/p')
     local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
     local server=""
     local port=""
     
     if [[ "$server_port" == "["* ]]; then
-        # IPv6
         server=$(echo "$server_port" | sed -n 's/\[\(.*\)\]:.*/\1/p')
         port=$(echo "$server_port" | sed -n 's/.*\]:\(.*\)/\1/p')
     else
-        # IPv4 or Domain
         server=$(echo "$server_port" | cut -d: -f1)
         port=$(echo "$server_port" | cut -d: -f2)
     fi
+    
     local query=$(echo "$link" | grep -oP '\?\K[^#]*' 2>/dev/null || echo "")
     
-    local security=$(echo "$query" | grep -oP 'security=\K[^&]*' 2>/dev/null || echo "none")
-    local network=$(echo "$query" | grep -oP '(type|network)=\K[^&]*' 2>/dev/null || echo "tcp")
-    local sni=$(echo "$query" | grep -oP 'sni=\K[^&]*' 2>/dev/null || echo "")
+    local flow=""
+    local security="none"
+    local sni=""
+    local pbk=""
+    local sid=""
+    local fp="chrome"
+    local network="tcp"
+    local path="/"
+    local serviceName=""
 
-    # 如果是 reality，将其视为 tls 处理，但在 outbound 中我们需要知道它是 vless
-    # 标准 sing-box outbound 不需要太复杂的 reality 客户端配置，除非我们要偷取它的 fingerprints
-    # 作为中转出口，最重要的是地址、端口、UUID和传输层
-    
-    local flow=$(echo "$query" | grep -oP 'flow=\K[^&]*' 2>/dev/null || echo "")
-    local path=$(echo "$query" | grep -oP 'path=\K[^&]*' 2>/dev/null || echo "/")
-    local serviceName=$(echo "$query" | grep -oP 'serviceName=\K[^&]*' 2>/dev/null || echo "")
+    IFS='&' read -ra PARAM_ARRAY <<< "$query"
+    for param in "${PARAM_ARRAY[@]}"; do
+        local key=$(echo "$param" | cut -d= -f1)
+        local value=$(echo "$param" | cut -d= -f2-)
+        case "$key" in
+            "flow") flow="$value" ;;
+            "security") security="$value" ;;
+            "sni"|"servername") sni="$value" ;;
+            "pbk") pbk="$value" ;;
+            "sid") sid="$value" ;;
+            "fp") fp="$value" ;;
+            "type"|"network") network="$value" ;;
+            "path") path=$(echo "$value" | sed 's/%2F/\//g') ;;
+            "serviceName") serviceName="$value" ;;
+        esac
+    done
 
+    # 构造 outbound
     jq -n \
         --arg s "$server" --arg p "$port" --arg u "$uuid" \
         --arg sec "$security" --arg net "$network" --arg sni "$sni" \
-        --arg flow "$flow" --arg path "$path" --arg snm "$serviceName" \
+        --arg flow "$flow" --arg pbk "$pbk" --arg sid "$sid" --arg fp "$fp" \
+        --arg path "$path" --arg snm "$serviceName" \
         '{
             type: "vless",
             server: $s,
@@ -241,11 +262,12 @@ _parse_vless_share_link() {
             tls: (if ($sec == "tls" or $sec == "reality") then {
                 enabled: true,
                 server_name: $sni,
-                utls: { enabled: true, fingerprint: "chrome" }
-            } else {
-                enabled: false
-            } end)
+                utls: { enabled: true, fingerprint: $fp }
+            } else { enabled: false } end)
         } | 
+        if ($sec == "reality") then 
+            .tls.reality = { enabled: true, public_key: $pbk, short_id: $sid }
+        else . end |
         if ($net == "ws") then 
             .transport = {type: "ws", path: $path, headers: {Host: $sni}} 
         elif ($net == "grpc") then 
@@ -277,7 +299,8 @@ _parse_vmess_share_link() {
             .transport = {type: "ws", path: ($data.path // "/"), headers: {Host: ($data.host // "")}}
         elif (.network == "grpc") then
             .transport = {type: "grpc", service_name: ($data.path // "")}
-        else . end'
+        else . end |
+        .packet_encoding = "xudp"'
 }
 
 _parse_shadowsocks_share_link() {
@@ -358,9 +381,11 @@ _parse_trojan_share_link() {
             server: $s,
             server_port: ($p|tonumber),
             password: $pw,
+            packet_encoding: "xudp",
             tls: {
                 enabled: true,
-                server_name: $sni
+                server_name: $sni,
+                utls: { enabled: true, fingerprint: "chrome" }
             }
         }'
 }
@@ -368,7 +393,6 @@ _parse_trojan_share_link() {
 _parse_hysteria2_share_link() {
     local link="$1"
     local password=$(echo "$link" | sed -n 's/hysteria2:\/\/\([^@]*\)@.*/\1/p')
-    # 处理 hy2:// 简写
     if [ -z "$password" ]; then
         password=$(echo "$link" | sed -n 's/hy2:\/\/\([^@]*\)@.*/\1/p')
     fi
@@ -376,10 +400,29 @@ _parse_hysteria2_share_link() {
     local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
     local server=$(echo "$server_port" | cut -d: -f1)
     local port=$(echo "$server_port" | cut -d: -f2)
-    local sni=$(echo "$link" | grep -oP 'sni=\K[^&#]*' 2>/dev/null || echo "$server")
+    local query=$(echo "$link" | grep -oP '\?\K[^#]*' 2>/dev/null || echo "")
+    
+    local sni="$server"
+    local insecure="0"
+    local obfs=""
+    local obfs_password=""
+
+    IFS='&' read -ra PARAM_ARRAY <<< "$query"
+    for param in "${PARAM_ARRAY[@]}"; do
+        local key=$(echo "$param" | cut -d= -f1)
+        local value=$(echo "$param" | cut -d= -f2-)
+        case "$key" in
+            "sni") sni="$value" ;;
+            "insecure"|"allow_insecure") insecure="1" ;;
+            "obfs") obfs="$value" ;;
+            "obfs-password") obfs_password="$value" ;;
+        esac
+    done
 
     jq -n \
-        --arg s "$server" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
+        --arg s "$server" --arg p "$port" --arg pw "$password" \
+        --arg sni "$sni" --arg insecure "$insecure" \
+        --arg obfs "$obfs" --arg obfs_pw "$obfs_password" \
         '{
             type: "hysteria2",
             server: $s,
@@ -387,7 +430,56 @@ _parse_hysteria2_share_link() {
             password: $pw,
             tls: {
                 enabled: true,
-                server_name: $sni
+                server_name: $sni,
+                insecure: (if $insecure == "1" then true else false end)
+            }
+        } |
+        if $obfs != "" then 
+            .obfs = { type: $obfs, password: $obfs_pw }
+        else . end |
+        .packet_encoding = "xudp"'
+}
+
+_parse_tuic_link() {
+    local link="$1"
+    # tuic://uuid:password@server:port?sni=...&insecure=1#name
+    local uuid=$(echo "$link" | sed -n 's/tuic:\/\/\([^:]*\):.*/\1/p')
+    local password=$(echo "$link" | sed -n 's/tuic:\/\/[^:]*:\([^@]*\)@.*/\1/p')
+    local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
+    local server=$(echo "$server_port" | cut -d: -f1)
+    local port=$(echo "$server_port" | cut -d: -f2)
+    local query=$(echo "$link" | grep -oP '\?\K[^#]*' 2>/dev/null || echo "")
+
+    local sni="$server"
+    local insecure="1"
+    local alpn="h3"
+
+    IFS='&' read -ra PARAM_ARRAY <<< "$query"
+    for param in "${PARAM_ARRAY[@]}"; do
+        local key=$(echo "$param" | cut -d= -f1)
+        local value=$(echo "$param" | cut -d= -f2-)
+        case "$key" in
+            "sni") sni="$value" ;;
+            "insecure"|"allow_insecure") insecure="1" ;;
+            "alpn") alpn="$value" ;;
+        esac
+    done
+
+    jq -n \
+        --arg s "$server" --arg p "$port" --arg u "$uuid" \
+        --arg pw "$password" --arg sni "$sni" --arg insecure "$insecure" --arg alpn "$alpn" \
+        '{
+            type: "tuic",
+            server: $s,
+            server_port: ($p|tonumber),
+            uuid: $u,
+            password: $pw,
+            congestion_control: "bbr",
+            tls: {
+                enabled: true,
+                server_name: $sni,
+                alpn: [$alpn],
+                insecure: (if $insecure == "1" then true else false end)
             }
         }'
 }
@@ -458,6 +550,9 @@ _parse_input_smart() {
     elif [[ "$input" == hysteria2://* ]] || [[ "$input" == hy2://* ]]; then
         outbound_json=$(_parse_hysteria2_share_link "$input")
         dest_type="hysteria2"
+    elif [[ "$input" == tuic://* ]]; then
+        outbound_json=$(_parse_tuic_link "$input")
+        dest_type="tuic"
     fi
 
     if [ -n "$outbound_json" ] && [ "$outbound_json" != "null" ]; then
