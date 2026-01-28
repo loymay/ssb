@@ -3859,14 +3859,10 @@ _advanced_features() {
         local download_url="${base_url}/${script_name}?v=$(date +%s)"
         
         if curl -s -H "Cache-Control: no-cache" -L -o "$local_script" "$download_url"; then
-                chmod +x "$local_script"
-                _success "下载成功！"
-            else
-                _error "下载失败，请检查网络。"
-                return
-            fi
+            chmod +x "$local_script"
+            _success "下载成功！"
         else
-            _error "无法找到远程脚本: $download_url"
+            _error "下载失败，请检查网络或找不到远程脚本。"
             return
         fi
     fi
