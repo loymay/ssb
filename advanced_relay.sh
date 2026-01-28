@@ -304,40 +304,63 @@ _parse_vmess_share_link() {
 
 _parse_shadowsocks_share_link() {
     local link="$1"
-    # ss://base64(method:password@server:port) 或 ss://base64(method:password)@server:port
-    local ss_body=$(echo "$link" | sed 's/ss:\/\/\([^#?]*\).*/\1/')
-    local method=""
-    local password=""
-    local server=""
-    local port=""
+    
+    # 1. URL 解码
+    local decoded_link="$link"
+    decoded_link="${decoded_link//%3A/:}"
+    decoded_link="${decoded_link//%2B/+}"
+    decoded_link="${decoded_link//%3D/=}"
+    decoded_link="${decoded_link//%2F//}"
+    
+    # 2. 移除 # 和 ? 部分
+    decoded_link="${decoded_link%%\?*}"
+    decoded_link="${decoded_link%%#*}"
+    
+    # 3. 提取 ss:// 后的部分
+    local ss_body="${decoded_link#ss://}"
+    local method password server port
     
     if [[ "$ss_body" == *"@"* ]]; then
+        # 格式: prefix@server:port
         local prefix="${ss_body%%@*}"
         local server_part="${ss_body##*@}"
-        server=$(echo "$server_part" | cut -d: -f1)
-        port=$(echo "$server_part" | cut -d: -f2 | tr -cd '0-9')
         
-        local decoded=$(echo -n "$prefix" | tr '_-' '/+' | base64 -d 2>/dev/null)
-        if [[ "$decoded" == *":"* ]]; then
-            method=$(echo "$decoded" | cut -d: -f1)
-            password=$(echo "$decoded" | cut -d: -f2-)
+        server="${server_part%:*}"
+        port="${server_part##*:}"
+        port=$(echo "$port" | tr -cd '0-9')
+        
+        # 尝试 Base64 解码前缀 (method:password)
+        local decoded_prefix=$(echo -n "$prefix" | tr '_-' '/+' | base64 -d 2>/dev/null)
+        if [ -n "$decoded_prefix" ] && [[ "$decoded_prefix" == *":"* ]]; then
+            method="${decoded_prefix%%:*}"
+            password="${decoded_prefix#*:}"
+        else
+            method="${prefix%%:*}"
+            password="${prefix#*:}"
         fi
     else
+        # 格式: ss://base64(method:password@server:port)
         local decoded=$(echo -n "$ss_body" | tr '_-' '/+' | base64 -d 2>/dev/null)
-        if [ -n "$decoded" ] && [[ "$decoded" == *":"* ]] && [[ "$decoded" == *"@"* ]]; then
-            local mp="${decoded%%@*}"
-            local sp="${decoded##*@}"
-            method=$(echo "$mp" | cut -d: -f1)
-            password=$(echo "$mp" | cut -d: -f2-)
-            server=$(echo "$sp" | cut -d: -f1)
-            port=$(echo "$sp" | cut -d: -f2 | tr -cd '0-9')
-        fi
+        [[ -z "$decoded" ]] && return 1
+        
+        local method_pass="${decoded%%@*}"
+        local server_port="${decoded##*@}"
+        method="${method_pass%%:*}"
+        password="${method_pass#*:}"
+        server="${server_port%:*}"
+        port="${server_port##*:}"
+        port=$(echo "$port" | tr -cd '0-9')
     fi
 
-    # 清洗关键字段
-    method=$(echo "$method" | tr -d '\r\n ')
-    password=$(echo "$password" | tr -d '\r\n ')
-    [[ -z "$method" || -z "$server" || -z "$port" ]] && return 1
+    # 清理空白字符 (使用 xargs 兼容性更好)
+    method=$(echo "$method" | xargs 2>/dev/null)
+    password=$(echo "$password" | xargs 2>/dev/null)
+    server=$(echo "$server" | xargs 2>/dev/null)
+    port=$(echo "$port" | xargs 2>/dev/null)
+
+    # 基础验证
+    [[ -z "$method" || -z "$password" || -z "$server" || -z "$port" ]] && return 1
+    [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
 
     jq -c -n --arg s "$server" --arg p "$port" --arg m "$method" --arg pw "$password" \
         '{"type":"shadowsocks","server":$s,"server_port":($p|tonumber),"method":$m,"password":$pw,"packet_encoding":"xudp"}'
