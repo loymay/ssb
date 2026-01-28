@@ -204,18 +204,17 @@ _check_deps() {
 
 _parse_vless_reality() {
     local link="$1"
-    # 复用主脚本逻辑解析 Reality/TLS 链接
-    local uuid=$(echo "$link" | sed -n 's|vless://\([^@]*\)@.*|\1|p')
+    local uuid=$(echo "$link" | sed -n 's|vless://\([^@]*\)@.*|\1|p' | tr -d '\r\n ')
     local server_port=$(echo "$link" | sed -n 's|vless://[^@]*@\([^?#/]*\).*|\1|p')
     local server=$(echo "$server_port" | cut -d: -f1)
-    local port=$(echo "$server_port" | cut -d: -f2)
+    local port=$(echo "$server_port" | cut -d: -f2 | tr -cd '0-9')
     
     local params=""
     [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
     
     local flow="xtls-rprx-vision"
     local security="reality"
-    local sni=""
+    local sni="$server"
     local pbk=""
     local sid=""
     local fp="chrome"
@@ -236,12 +235,10 @@ _parse_vless_reality() {
         done
     fi
 
-    [[ -z "$sni" ]] && sni="$server"
-
     jq -c -n \
         --arg server "$server" --arg port "$port" --arg uuid "$uuid" \
         --arg flow "$flow" --arg sni "$sni" --arg pbk "$pbk" \
-        --arg sid "$sid" --arg fp "$fp" --arg security "$security" \
+        --arg sid "$sid" --arg fp "$fp" \
         '{
             type: "vless",
             server: $server,
@@ -262,11 +259,10 @@ _parse_vless_reality() {
 
 _parse_vless_plain() {
     local link="$1"
-    # 专门处理裸 VLESS TCP，模拟 Token 模式
-    local uuid=$(echo "$link" | sed -n 's|vless://\([^@]*\)@.*|\1|p')
+    local uuid=$(echo "$link" | sed -n 's|vless://\([^@]*\)@.*|\1|p' | tr -d '\r\n ')
     local server_port=$(echo "$link" | sed -n 's|vless://[^@]*@\([^?#/]*\).*|\1|p')
     local server=$(echo "$server_port" | cut -d: -f1)
-    local port=$(echo "$server_port" | cut -d: -f2)
+    local port=$(echo "$server_port" | cut -d: -f2 | tr -cd '0-9')
     
     [[ -z "$server" || -z "$port" ]] && return 1
 
@@ -308,7 +304,7 @@ _parse_vmess_share_link() {
 
 _parse_shadowsocks_share_link() {
     local link="$1"
-    # Step 1: 移除 # 和 ? 部分提取主体
+    # 格式支持: ss://base64(method:password)@server:port 或 ss://base64(method:password@server:port)
     local ss_body=$(echo "$link" | sed 's/ss:\/\/\([^#?]*\).*/\1/')
     local method=""
     local password=""
@@ -318,27 +314,33 @@ _parse_shadowsocks_share_link() {
     if [[ "$ss_body" == *"@"* ]]; then
         local prefix="${ss_body%%@*}"
         local server_port="${ss_body##*@}"
-        server="${server_port%:*}"
-        port="${server_port##*:}"
+        server=$(echo "$server_port" | cut -d: -f1)
+        port=$(echo "$server_port" | cut -d: -f2 | tr -cd '0-9')
         
-        local decoded_prefix=$(echo -n "$prefix" | base64 -d 2>/dev/null)
+        # 尝试解码前缀
+        local decoded_prefix=$(echo -n "$prefix" | tr '_-' '/+' | base64 -d 2>/dev/null)
         if [ -n "$decoded_prefix" ] && [[ "$decoded_prefix" == *":"* ]]; then
-            method="${decoded_prefix%%:*}"
-            password="${decoded_prefix#*:}"
+            method=$(echo "$decoded_prefix" | cut -d: -f1)
+            password=$(echo "$decoded_prefix" | cut -d: -f2-)
         else
-            method="${prefix%%:*}"
-            password="${prefix#*:}"
+            method=$(echo "$prefix" | cut -d: -f1)
+            password=$(echo "$prefix" | cut -d: -f2-)
         fi
     else
-        local decoded=$(echo -n "$ss_body" | base64 -d 2>/dev/null)
+        # 处理全 Base64 格式
+        local decoded=$(echo -n "$ss_body" | tr '_-' '/+' | base64 -d 2>/dev/null)
         if [ -z "$decoded" ]; then return 1; fi
         local method_pass="${decoded%%@*}"
         local server_port="${decoded##*@}"
-        method="${method_pass%%:*}"
-        password="${method_pass#*:}"
-        server="${server_port%:*}"
-        port="${server_port##*:}"
+        method=$(echo "$method_pass" | cut -d: -f1)
+        password=$(echo "$method_pass" | cut -d: -f2-)
+        server=$(echo "$server_port" | cut -d: -f1)
+        port=$(echo "$server_port" | cut -d: -f2 | tr -cd '0-9')
     fi
+
+    # 清洗关键数据，防止非法字符
+    method=$(echo "$method" | tr -d '\r\n ')
+    password=$(echo "$password" | tr -d '\r\n ')
 
     jq -c -n \
         --arg server "$server" --arg port "$port" \
@@ -348,17 +350,17 @@ _parse_shadowsocks_share_link() {
             server: $server,
             server_port: ($port|tonumber),
             method: $method,
-            password: $password
+            password: $password,
+            packet_encoding: "xudp"
         }'
 }
 
 _parse_trojan_share_link() {
     local link="$1"
-    # trojan://password@server:port?sni=xxx#name
-    local password=$(echo "$link" | sed -n 's|trojan://\([^@]*\)@.*|\1|p')
+    local password=$(echo "$link" | sed -n 's|trojan://\([^@]*\)@.*|\1|p' | tr -d '\r\n ')
     local server_port=$(echo "$link" | sed -n 's|trojan://[^@]*@\([^?#/]*\).*|\1|p')
     local server=$(echo "$server_port" | cut -d: -f1)
-    local port=$(echo "$server_port" | cut -d: -f2)
+    local port=$(echo "$server_port" | cut -d: -f2 | tr -cd '0-9')
     
     [[ -z "$server" || -z "$port" ]] && return 1
     
@@ -436,12 +438,13 @@ _parse_hysteria2_share_link() {
                 server_name: $sni,
                 insecure: $insecure,
                 alpn: ["h3"]
-            }
+            },
+            multiplex: { enabled: true, protocol: "smux" },
+            packet_encoding: "xudp"
         } |
         if $obfs != "" then 
             .obfs = { type: $obfs, password: $obfs_pw }
-        else . end |
-        .packet_encoding = "xudp"'
+        else . end'
 }
 
 _parse_tuic_link() {
@@ -493,7 +496,8 @@ _parse_tuic_link() {
                 server_name: $sni,
                 insecure: $insecure,
                 alpn: ["h3"]
-            }
+            },
+            multiplex: { enabled: true, protocol: "smux" }
         }'
 }
 
