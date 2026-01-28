@@ -206,7 +206,7 @@ _parse_vless_share_link() {
     local link="$1"
     # vless://uuid@server:port?param1=value1&param2=value2#name
     local uuid=$(echo "$link" | sed -n 's|vless://\([^@]*\)@.*|\1|p')
-    local server_port=$(echo "$link" | sed -n 's|.*@\([^?#]*\).*|\1|p')
+    local server_port=$(echo "$link" | sed -n 's|vless://[^@]*@\([^?#/]*\).*|\1|p')
     
     local server=""
     local port=""
@@ -218,6 +218,8 @@ _parse_vless_share_link() {
         port=$(echo "$server_port" | cut -d: -f2)
     fi
     
+    [[ -z "$server" || -z "$port" ]] && return 1
+
     local params=""
     [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
     
@@ -283,10 +285,14 @@ _parse_vless_share_link() {
 
 _parse_vmess_share_link() {
     local link="$1"
-    local json=$(echo "$link" | sed 's/vmess:\/\///' | base64 -d 2>/dev/null)
-    if [ -z "$json" ]; then return 1; fi
+    local decoded=$(echo "$link" | sed 's/vmess:\/\///' | base64 -d 2>/dev/null)
+    if [ -z "$decoded" ]; then return 1; fi
     
-    jq -c -n --argjson data "$json" \
+    # 尝试提取 add 字段，如果解析失败说明内容不是合法的 VMess JSON
+    local add=$(echo "$decoded" | jq -r .add 2>/dev/null)
+    [[ -z "$add" || "$add" == "null" ]] && return 1
+
+    jq -c -n --argjson data "$decoded" \
         '{
             type: "vmess",
             server: ($data.add),
@@ -359,9 +365,11 @@ _parse_trojan_share_link() {
     local link="$1"
     # trojan://password@server:port?sni=xxx#name
     local password=$(echo "$link" | sed -n 's|trojan://\([^@]*\)@.*|\1|p')
-    local server_port=$(echo "$link" | sed -n 's|.*@\([^?#]*\).*|\1|p')
+    local server_port=$(echo "$link" | sed -n 's|trojan://[^@]*@\([^?#/]*\).*|\1|p')
     local server=$(echo "$server_port" | cut -d: -f1)
     local port=$(echo "$server_port" | cut -d: -f2)
+    
+    [[ -z "$server" || -z "$port" ]] && return 1
     
     local params=""
     [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
@@ -393,9 +401,11 @@ _parse_hysteria2_share_link() {
     local password=$(echo "$link" | sed -n 's|hysteria2://\([^@]*\)@.*|\1|p')
     [[ -z "$password" ]] && password=$(echo "$link" | sed -n 's|hy2://\([^@]*\)@.*|\1|p')
     
-    local server_part=$(echo "$link" | sed -n 's|.*@\([^?#]*\).*|\1|p')
+    local server_part=$(echo "$link" | sed -n 's|.*@\([^?#/]*\).*|\1|p')
     local server=$(echo "$server_part" | cut -d: -f1)
     local port=$(echo "$server_part" | cut -d: -f2)
+    
+    [[ -z "$server" || -z "$port" ]] && return 1
     
     local params=""
     [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
@@ -447,9 +457,11 @@ _parse_tuic_link() {
     local link="$1"
     local uuid=$(echo "$link" | sed -n 's|tuic://\([^:]*\):.*|\1|p')
     local password=$(echo "$link" | sed -n 's|tuic://[^:]*:\([^@]*\)@.*|\1|p')
-    local server_part=$(echo "$link" | sed -n 's|.*@\([^?#]*\).*|\1|p')
+    local server_part=$(echo "$link" | sed -n 's|.*@\([^?#/]*\).*|\1|p')
     local server=$(echo "$server_part" | cut -d: -f1)
     local port=$(echo "$server_part" | cut -d: -f2)
+    
+    [[ -z "$server" || -z "$port" ]] && return 1
     
     local params=""
     [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
@@ -664,10 +676,12 @@ _relay_config() {
     fi
     
     _info "正在解析..."
-    local result=$(_parse_input_smart "$input")
+    local result
+    result=$(_parse_input_smart "$input")
+    local status=$?
     
-    if [ $? -ne 0 ]; then
-        _error "无法解析输入内容！请检查格式。"
+    if [ $status -ne 0 ] || [ -z "$result" ]; then
+        _error "无法解析输入内容！请检查是否为有效的分享链接或 Token。"
         _pause
         return
     fi
@@ -675,10 +689,17 @@ _relay_config() {
     # 解析结果格式: outbound_json|type
     local outbound_json=$(echo "$result" | cut -d'|' -f1)
     local dest_type=$(echo "$result" | cut -d'|' -f2)
-    local dest_addr=$(echo "$outbound_json" | jq -r .server)
-    local dest_port=$(echo "$outbound_json" | jq -r .server_port)
     
-    _success "解析成功: ${dest_type} -> ${dest_addr}:${dest_port}"
+    local dest_addr=$(echo "$outbound_json" | jq -r .server 2>/dev/null)
+    local dest_port=$(echo "$outbound_json" | jq -r .server_port 2>/dev/null)
+    
+    if [ -z "$dest_addr" ] || [ "$dest_addr" == "null" ]; then
+        _error "解析失败：未能提取到有效的服务器地址。"
+        _pause
+        return
+    fi
+
+    _success "解析成功: ${dest_addr}:${dest_port}"
     
     _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
 }
