@@ -3856,7 +3856,7 @@ _advanced_features() {
         
         # 从主脚本 URL 推断 base URL
         local base_url=$(dirname "$SCRIPT_UPDATE_URL")
-        local download_url="${base_url}/${script_name}"
+        local download_url="${base_url}/${script_name}?v=$(date +%s)"
         
         if curl -s --head --fail "$download_url" >/dev/null; then
             if curl -s -L -o "$local_script" "$download_url"; then
