@@ -3858,8 +3858,7 @@ _advanced_features() {
         local base_url=$(dirname "$SCRIPT_UPDATE_URL")
         local download_url="${base_url}/${script_name}?v=$(date +%s)"
         
-        if curl -s --head --fail "$download_url" >/dev/null; then
-            if curl -s -L -o "$local_script" "$download_url"; then
+        if curl -s -H "Cache-Control: no-cache" -L -o "$local_script" "$download_url"; then
                 chmod +x "$local_script"
                 _success "下载成功！"
             else
