@@ -124,11 +124,13 @@ _get_country_flag() {
         local char="${country_code:$i:1}"
         local ascii_val=$(printf "%d" "'$char")
         local emoji_val=$((ascii_val + 127397))
-        # 使用更稳健的方式渲染 Emoji: 直接构造 UTF-8 字节序列或使用标准的 bash 4.2+ \U
-        # 对大多数现代 bash 环境，\U 是最稳健的
-        local hex=$(printf "%08x" $emoji_val)
-        local f=$(printf "\\U$hex" 2>/dev/null || echo -e "\\U$hex")
-        flag+="$f"
+        local hex=$(printf "%x" $emoji_val)
+        # 尝试最通用的方式
+        local f=$(printf "\\U$hex" 2>/dev/null)
+        if [ $? -ne 0 ] || [ -z "$f" ]; then
+            f=$(echo -e "\\U$(printf "%08x" $emoji_val)" 2>/dev/null)
+        fi
+        flag+="${f:-$char}" # 如果都失败，降级显示字母
     done
     echo "$flag"
 }
@@ -246,7 +248,7 @@ _parse_vless_share_link() {
     done
 
     # 构造 outbound
-    jq -n \
+    jq -c -n \
         --arg s "$server" --arg p "$port" --arg u "$uuid" \
         --arg sec "$security" --arg net "$network" --arg sni "$sni" \
         --arg flow "$flow" --arg pbk "$pbk" --arg sid "$sid" --arg fp "$fp" \
@@ -280,7 +282,7 @@ _parse_vmess_share_link() {
     local json=$(echo "$link" | sed 's/vmess:\/\///' | base64 -d 2>/dev/null)
     if [ -z "$json" ]; then return 1; fi
     
-    jq -n --argjson data "$json" \
+    jq -c -n --argjson data "$json" \
         '{
             type: "vmess",
             server: ($data.add),
@@ -353,7 +355,7 @@ _parse_shadowsocks_share_link() {
     local server=$(echo "$server_port" | cut -d: -f1)
     local port=$(echo "$server_port" | cut -d: -f2)
     
-    jq -n \
+    jq -c -n \
         --arg s "$server" --arg p "$port" \
         --arg m "$method" --arg pw "$password" \
         '{
@@ -374,7 +376,7 @@ _parse_trojan_share_link() {
     local port=$(echo "$server_port" | cut -d: -f2)
     local sni=$(echo "$link" | grep -oP 'sni=\K[^&#]*' 2>/dev/null || echo "$server")
     
-    jq -n \
+    jq -c -n \
         --arg s "$server" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
         '{
             type: "trojan",
@@ -419,7 +421,7 @@ _parse_hysteria2_share_link() {
         esac
     done
 
-    jq -n \
+    jq -c -n \
         --arg s "$server" --arg p "$port" --arg pw "$password" \
         --arg sni "$sni" --arg insecure "$insecure" \
         --arg obfs "$obfs" --arg obfs_pw "$obfs_password" \
@@ -465,7 +467,7 @@ _parse_tuic_link() {
         esac
     done
 
-    jq -n \
+    jq -c -n \
         --arg s "$server" --arg p "$port" --arg u "$uuid" \
         --arg pw "$password" --arg sni "$sni" --arg insecure "$insecure" --arg alpn "$alpn" \
         '{
