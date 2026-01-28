@@ -656,6 +656,7 @@ _add_argo_vless_ws() {
     
     echo ""
     _success "VLESS-WS + Argo 节点创建成功!"
+    _enable_argo_watchdog
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
     echo -e "接入地址: ${CYAN}${connect_address}${NC}"
@@ -853,6 +854,7 @@ _add_argo_trojan_ws() {
     
     echo ""
     _success "Trojan-WS + Argo 节点创建成功!"
+    _enable_argo_watchdog
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
     echo -e "接入地址: ${CYAN}${connect_address}${NC}"
@@ -1054,58 +1056,103 @@ _restart_argo_tunnel_menu() {
     fi
 }
 
+_argo_keepalive() {
+    # --- 性能优化: 互斥锁 ---
+    local lock_file="/tmp/singbox_keepalive.lock"
+    if [ -f "$lock_file" ]; then
+        local pid=$(cat "$lock_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            # 进程仍在运行，跳过本次执行
+            return
+        fi
+    fi
+    echo "$$" > "$lock_file"
+    # 确保退出时删除锁
+    trap 'rm -f "$lock_file"' RETURN EXIT
+
+    # --- 性能优化: 日志轮转 (10MB) ---
+    local max_size=$((10 * 1024 * 1024))
+    for log in "$LOG_FILE" "$ARGO_LOG_FILE"; do
+        if [ -f "$log" ] && [ $(stat -c%s "$log" 2>/dev/null || echo 0) -ge $max_size ]; then
+            tail -n 1000 "$log" > "${log}.tmp" && mv "${log}.tmp" "$log"
+        fi
+    done
+
+    # 如果元数据文件不存在或为空，不需要守护
+    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
+        return
+    fi
+
+    # 遍历所有节点
+    local tags=$(jq -r 'keys[]' "$ARGO_METADATA_FILE")
+
+    for tag in $tags; do
+        local port=$(jq -r ".\"$tag\".local_port" "$ARGO_METADATA_FILE")
+        local type=$(jq -r ".\"$tag\".type" "$ARGO_METADATA_FILE")
+        local token=$(jq -r ".\"$tag\".token // empty" "$ARGO_METADATA_FILE")
+        
+        local pid_file="/tmp/singbox_argo_${port}.pid"
+        local is_running=false
+
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file" 2>/dev/null)
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                is_running=true
+            fi
+        fi
+
+        if [ "$is_running" == "false" ]; then
+            logger "sing-box-watchdog: Detected dead tunnel for $tag (Port: $port). Restarting..."
+            if [ "$type" == "fixed" ] && [ -n "$token" ]; then
+                 _start_argo_tunnel "$port" "fixed" "$token"
+            else
+                 local new_domain=$(_start_argo_tunnel "$port" "temp")
+                 if [ -n "$new_domain" ]; then
+                      _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".domain = \"$new_domain\""
+                 fi
+            fi
+        fi
+    done
+}
+
+_enable_argo_watchdog() {
+    local job="* * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
+    if ! crontab -l 2>/dev/null | grep -Fq "$job"; then
+        _info "正在开启后台守护进程..."
+        (crontab -l 2>/dev/null; echo "$job") | crontab -
+    fi
+}
+
+_disable_argo_watchdog() {
+    local job="bash ${SELF_SCRIPT_PATH} keepalive"
+    crontab -l 2>/dev/null | grep -Fv "$job" | crontab - 2>/dev/null
+}
+
 _uninstall_argo() {
     _warning "！！！警告！！！"
     _warning "本操作将删除所有 Argo 隧道节点和 cloudflared 程序。"
     echo ""
-    echo "即将删除的内容："
-    echo -e "  ${RED}-${NC} cloudflared 程序: ${CLOUDFLARED_BIN}"
-    echo -e "  ${RED}-${NC} Argo 日志文件: ${ARGO_LOG_FILE}"
-    echo -e "  ${RED}-${NC} Argo 元数据文件: ${ARGO_METADATA_FILE}"
     
-    if [ -f "$ARGO_METADATA_FILE" ]; then
-        local argo_count=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null || echo "0")
-        echo -e "  ${RED}-${NC} Argo 节点数量: ${argo_count} 个"
-    fi
-    
-    echo ""
     read -p "$(echo -e ${YELLOW}"确定要卸载 Argo 服务吗? (y/N): "${NC})" confirm
-    
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        _info "卸载已取消。"
-        return
-    fi
-    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then return; fi
+
     _info "正在卸载 Argo 服务..."
+    _stop_all_argo_tunnels
     
-    # 1. 停止隧道进程
-    _stop_argo_tunnel
-    
-    # 2. 删除 sing-box 中的 Argo inbound 配置
     if [ -f "$ARGO_METADATA_FILE" ]; then
-        jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null | while read -r tag; do
-            if [ -n "$tag" ]; then
-                _info "正在删除节点配置: ${tag}"
-                jq "del(.inbounds[] | select(.tag == \"$tag\"))" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-                
-                # [!] 同步清理主 metadata.json
-                _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")"
-                
-                # 删除 Clash 配置
-                local node_name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE" 2>/dev/null)
-                if [ -n "$node_name" ] && [ "$node_name" != "null" ]; then
-                    _remove_node_from_yaml "$node_name"
-                fi
-            fi
+        local tags=$(jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null)
+        for tag in $tags; do
+            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
+            local node_name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE" 2>/dev/null)
+            [ -n "$node_name" ] && _remove_node_from_yaml "$node_name"
         done
     fi
-    
-    # 3. 删除 cloudflared 和相关文件
-    rm -f "${CLOUDFLARED_BIN}" "${ARGO_PID_FILE}" "${ARGO_LOG_FILE}" "${ARGO_METADATA_FILE}"
-    
-    # 4. 重启 sing-box
+
+    _disable_argo_watchdog
+    pkill -f "cloudflared" 2>/dev/null
+    rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
+    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}"
     _manage_service "restart"
-    
     _success "Argo 服务已完全卸载！"
     _success "已释放 cloudflared 占用的空间。"
 }
@@ -1162,16 +1209,30 @@ _argo_menu() {
 # --- 服务与配置管理 ---
 
 _create_systemd_service() {
+    # 自动计算 GOMEMLIMIT (目标 95%，但至少保留 40MB 给系统)
+    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+    local mem_limit_mb=$((total_mem_mb * 95 / 100))
+    local reserved_mb=$((total_mem_mb - mem_limit_mb))
+
+    if [ "$reserved_mb" -lt 40 ]; then
+        mem_limit_mb=$((total_mem_mb - 40))
+    fi
+
+    if [ "$mem_limit_mb" -lt 10 ]; then mem_limit_mb=10; fi # 极端情况保底
+
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
+
 [Service]
+Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
-RestartSec=10s
+RestartSec=3s
 LimitNOFILE=infinity
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -1180,20 +1241,41 @@ EOF
 _create_openrc_service() {
     # 确保日志文件存在
     touch "${LOG_FILE}"
-    
+
+    # 自动计算 GOMEMLIMIT (目标 95%，但至少保留 40MB 给系统)
+    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+    local mem_limit_mb=$((total_mem_mb * 95 / 100))
+    local reserved_mb=$((total_mem_mb - mem_limit_mb))
+
+    if [ "$reserved_mb" -lt 40 ]; then
+        mem_limit_mb=$((total_mem_mb - 40))
+    fi
+
+    if [ "$mem_limit_mb" -lt 10 ]; then mem_limit_mb=10; fi
+
     cat > "$SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
 
 description="sing-box service"
 command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
-command_background=true
+
+# 使用 supervise-daemon 实现守护和重启
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+
 pidfile="${PID_FILE}"
-start_stop_daemon_args="--stdout ${LOG_FILE} --stderr ${LOG_FILE}"
+output_log="${LOG_FILE}"
+error_log="${LOG_FILE}"
 
 depend() {
     need net
     after firewall
+}
+
+start_pre() {
+    export GOMEMLIMIT="${mem_limit_mb}MiB"
 }
 EOF
     chmod +x "$SERVICE_FILE"
@@ -2107,15 +2189,9 @@ _add_anytls() {
             "listen_port": ($p|tonumber),
             "users": [{"name": "default", "password": $pw}],
             "padding_scheme": [
-                "stop=8",
-                "0=30-30",
-                "1=100-400",
-                "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-                "3=9-9,500-1000",
-                "4=500-1000",
-                "5=500-1000",
-                "6=500-1000",
-                "7=500-1000"
+                "stop=2",
+                "0=100-200",
+                "1=100-200"
             ],
             "tls": {
                 "enabled": true,
@@ -2367,6 +2443,10 @@ _add_hysteria2() {
     
     # [!] 自定义名称 (包含地区旗帜)
     local default_name="Hysteria2-${port}"
+    if [ "$is_cdn_mode" == "true" ]; then 
+        default_name="Hysteria2-CDN-443" 
+    fi
+    
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name="${server_flag}${custom_name:-$default_name}"
     
@@ -3208,7 +3288,7 @@ _import_third_party_node() {
     _info "本地适配层: ${adapter_name}"
     
     # 生成配置
-    _create_third_party_adapter "$protocol" "$parse_result" "$adapter_type" "$adapter_method" "$local_port" "$adapter_name"
+    _create_third_party_adapter "$third_party_protocol" "$third_party_config" "$adapter_type" "$adapter_method" "$local_port" "$adapter_name"
 }
 
 # 解析 VLESS 链接
@@ -4648,15 +4728,6 @@ _create_shortcut() {
 # --- 脚本入口 ---
 
 main() {
-    _check_root
-    _detect_init_system
-    
-    # [!!!] 最终修复：
-    # 1. 必须始终检查依赖 (yq)，因为 relay.sh 不会安装 yq
-    # 2. 检查 sing-box 程序
-    # 3. 检查配置文件
-    
-    # 1. 始终检查依赖 (特别是 yq)
     # _install_dependencies 函数内部有 "command -v" 检查，所以重复运行是安全的
     _info "正在检查核心依赖 (yq)..."
     _install_dependencies
