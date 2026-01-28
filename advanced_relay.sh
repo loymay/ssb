@@ -204,24 +204,25 @@ _check_deps() {
 
 _parse_vless_share_link() {
     local link="$1"
+    # vless://uuid@server:port?param1=value1&param2=value2#name
+    local uuid=$(echo "$link" | sed -n 's|vless://\([^@]*\)@.*|\1|p')
+    local server_port=$(echo "$link" | sed -n 's|.*@\([^?#]*\).*|\1|p')
     
-    local uuid=$(echo "$link" | sed -n 's/vless:\/\/\([^@]*\)@.*/\1/p')
-    local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
     local server=""
     local port=""
-    
     if [[ "$server_port" == "["* ]]; then
-        server=$(echo "$server_port" | sed -n 's/\[\(.*\)\]:.*/\1/p')
-        port=$(echo "$server_port" | sed -n 's/.*\]:\(.*\)/\1/p')
+        server=$(echo "$server_port" | sed -n 's|\[\(.*\)\]:.*|\1|p')
+        port=$(echo "$server_port" | sed -n 's|.*\]:\([0-9]*\).*|\1|p')
     else
         server=$(echo "$server_port" | cut -d: -f1)
         port=$(echo "$server_port" | cut -d: -f2)
     fi
     
-    local query=$(echo "$link" | grep -oP '\?\K[^#]*' 2>/dev/null || echo "")
+    local params=""
+    [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
     
     local flow=""
-    local security="none"
+    local security=""
     local sni=""
     local pbk=""
     local sid=""
@@ -230,44 +231,47 @@ _parse_vless_share_link() {
     local path="/"
     local serviceName=""
 
-    IFS='&' read -ra PARAM_ARRAY <<< "$query"
-    for param in "${PARAM_ARRAY[@]}"; do
-        local key=$(echo "$param" | cut -d= -f1)
-        local value=$(echo "$param" | cut -d= -f2-)
-        case "$key" in
-            "flow") flow="$value" ;;
-            "security") security="$value" ;;
-            "sni"|"servername") sni="$value" ;;
-            "pbk") pbk="$value" ;;
-            "sid") sid="$value" ;;
-            "fp") fp="$value" ;;
-            "type"|"network") network="$value" ;;
-            "path") path=$(echo "$value" | sed 's/%2F/\//g') ;;
-            "serviceName") serviceName="$value" ;;
-        esac
-    done
+    if [ -n "$params" ]; then
+        IFS='&' read -ra PARAM_ARRAY <<< "$params"
+        for param in "${PARAM_ARRAY[@]}"; do
+            local key=$(echo "$param" | cut -d= -f1)
+            local value=$(echo "$param" | cut -d= -f2-)
+            case "$key" in
+                "flow") flow="$value" ;;
+                "security") security="$value" ;;
+                "sni"|"servername") sni="$value" ;;
+                "pbk") pbk="$value" ;;
+                "sid") sid="$value" ;;
+                "fp") fp="$value" ;;
+                "type"|"network") network="$value" ;;
+                "path") path=$(echo "$value" | sed 's/%2F/\//g') ;;
+                "serviceName") serviceName="$value" ;;
+            esac
+        done
+    fi
 
-    # 构造 outbound
+    [[ -z "$sni" ]] && sni="$server"
+
     jq -c -n \
-        --arg s "$server" --arg p "$port" --arg u "$uuid" \
-        --arg sec "$security" --arg net "$network" --arg sni "$sni" \
-        --arg flow "$flow" --arg pbk "$pbk" --arg sid "$sid" --arg fp "$fp" \
+        --arg server "$server" --arg port "$port" --arg uuid "$uuid" \
+        --arg flow "$flow" --arg sni "$sni" --arg pbk "$pbk" \
+        --arg sid "$sid" --arg fp "$fp" --arg net "$network" \
         --arg path "$path" --arg snm "$serviceName" \
+        --arg security "$security" \
         '{
             type: "vless",
-            server: $s,
-            server_port: ($p|tonumber),
-            uuid: $u,
+            server: $server,
+            server_port: ($port|tonumber),
+            uuid: $uuid,
             flow: $flow,
-            network: $net,
             packet_encoding: "xudp",
-            tls: (if ($sec == "tls" or $sec == "reality") then {
+            tls: (if ($security == "reality" or $security == "tls") then {
                 enabled: true,
                 server_name: $sni,
                 utls: { enabled: true, fingerprint: $fp }
             } else { enabled: false } end)
-        } | 
-        if ($sec == "reality") then 
+        } |
+        if ($security == "reality") then 
             .tls.reality = { enabled: true, public_key: $pbk, short_id: $sid }
         else . end |
         if ($net == "ws") then 
@@ -307,82 +311,74 @@ _parse_vmess_share_link() {
 
 _parse_shadowsocks_share_link() {
     local link="$1"
-    # ss://base64(method:password)@server:port#name
-    # 或 ss://method:password@server:port#name
-    local main=$(echo "$link" | sed 's/ss:\/\///; s/#.*//')
-    
-    local userinfo=""
-    local server_port=""
-    
-    if [[ "$main" == *.* ]]; then
-        # 可能是未base64的格式 user:pass@ip:port
-        # 但标准 URL encoding 中 @ 之前是 userinfo
-        if echo "$main" | grep -q "@"; then
-            userinfo=$(echo "$main" | cut -d@ -f1)
-            server_port=$(echo "$main" | cut -d@ -f2)
-        else
-            # 可能是旧版 base64(method:password@server:port)
-            local decoded=$(echo "$main" | base64 -d 2>/dev/null)
-            if [ -n "$decoded" ]; then
-                userinfo=$(echo "$decoded" | cut -d@ -f1)
-                server_port=$(echo "$decoded" | cut -d@ -f2)
-            fi
-        fi
-    fi
-
-    # 如果 userinfo 还是空的，可能是 pure base64 userinfo
-    if [ -z "$userinfo" ]; then
-        # 尝试标准解析: userinfo@server:port
-        userinfo=$(echo "$main" | cut -d@ -f1)
-        server_port=$(echo "$main" | cut -d@ -f2)
-    fi
-
+    # Step 1: 移除 # 和 ? 部分提取主体
+    local ss_body=$(echo "$link" | sed 's/ss:\/\/\([^#?]*\).*/\1/')
     local method=""
     local password=""
+    local server=""
+    local port=""
     
-    # 检查 userinfo 是否 base64 编码 (含冒号一般没编码，不含冒号可能编码了)
-    if [[ "$userinfo" != *:* ]]; then
-        local decoded=$(echo "$userinfo" | base64 -d 2>/dev/null)
-        if [[ "$decoded" == *:* ]]; then
-             method=$(echo "$decoded" | cut -d: -f1)
-             password=$(echo "$decoded" | cut -d: -f2-)
+    if [[ "$ss_body" == *"@"* ]]; then
+        local prefix="${ss_body%%@*}"
+        local server_port="${ss_body##*@}"
+        server="${server_port%:*}"
+        port="${server_port##*:}"
+        
+        local decoded_prefix=$(echo -n "$prefix" | base64 -d 2>/dev/null)
+        if [ -n "$decoded_prefix" ] && [[ "$decoded_prefix" == *":"* ]]; then
+            method="${decoded_prefix%%:*}"
+            password="${decoded_prefix#*:}"
+        else
+            method="${prefix%%:*}"
+            password="${prefix#*:}"
         fi
     else
-        method=$(echo "$userinfo" | cut -d: -f1)
-        password=$(echo "$userinfo" | cut -d: -f2-)
+        local decoded=$(echo -n "$ss_body" | base64 -d 2>/dev/null)
+        if [ -z "$decoded" ]; then return 1; fi
+        local method_pass="${decoded%%@*}"
+        local server_port="${decoded##*@}"
+        method="${method_pass%%:*}"
+        password="${method_pass#*:}"
+        server="${server_port%:*}"
+        port="${server_port##*:}"
     fi
-    
-    local server=$(echo "$server_port" | cut -d: -f1)
-    local port=$(echo "$server_port" | cut -d: -f2)
-    
+
     jq -c -n \
-        --arg s "$server" --arg p "$port" \
-        --arg m "$method" --arg pw "$password" \
+        --arg server "$server" --arg port "$port" \
+        --arg method "$method" --arg password "$password" \
         '{
             type: "shadowsocks",
-            server: $s,
-            server_port: ($p|tonumber),
-            method: $m,
-            password: $pw
+            server: $server,
+            server_port: ($port|tonumber),
+            method: $method,
+            password: $password
         }'
 }
 
 _parse_trojan_share_link() {
     local link="$1"
     # trojan://password@server:port?sni=xxx#name
-    local password=$(echo "$link" | sed -n 's/trojan:\/\/\([^@]*\)@.*/\1/p')
-    local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
+    local password=$(echo "$link" | sed -n 's|trojan://\([^@]*\)@.*|\1|p')
+    local server_port=$(echo "$link" | sed -n 's|.*@\([^?#]*\).*|\1|p')
     local server=$(echo "$server_port" | cut -d: -f1)
     local port=$(echo "$server_port" | cut -d: -f2)
-    local sni=$(echo "$link" | grep -oP 'sni=\K[^&#]*' 2>/dev/null || echo "$server")
+    
+    local params=""
+    [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
+    
+    local sni="$server"
+    if [ -n "$params" ]; then
+        sni=$(echo "$params" | grep -oP 'sni=\K[^&]*' 2>/dev/null || echo "$server")
+    fi
     
     jq -c -n \
-        --arg s "$server" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
+        --arg server "$server" --arg port "$port" \
+        --arg password "$password" --arg sni "$sni" \
         '{
             type: "trojan",
-            server: $s,
-            server_port: ($p|tonumber),
-            password: $pw,
+            server: $server,
+            server_port: ($port|tonumber),
+            password: $password,
             packet_encoding: "xudp",
             tls: {
                 enabled: true,
@@ -394,46 +390,51 @@ _parse_trojan_share_link() {
 
 _parse_hysteria2_share_link() {
     local link="$1"
-    local password=$(echo "$link" | sed -n 's/hysteria2:\/\/\([^@]*\)@.*/\1/p')
-    if [ -z "$password" ]; then
-        password=$(echo "$link" | sed -n 's/hy2:\/\/\([^@]*\)@.*/\1/p')
-    fi
+    local password=$(echo "$link" | sed -n 's|hysteria2://\([^@]*\)@.*|\1|p')
+    [[ -z "$password" ]] && password=$(echo "$link" | sed -n 's|hy2://\([^@]*\)@.*|\1|p')
     
-    local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
-    local server=$(echo "$server_port" | cut -d: -f1)
-    local port=$(echo "$server_port" | cut -d: -f2)
-    local query=$(echo "$link" | grep -oP '\?\K[^#]*' 2>/dev/null || echo "")
+    local server_part=$(echo "$link" | sed -n 's|.*@\([^?#]*\).*|\1|p')
+    local server=$(echo "$server_part" | cut -d: -f1)
+    local port=$(echo "$server_part" | cut -d: -f2)
+    
+    local params=""
+    [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
     
     local sni="$server"
-    local insecure="0"
+    local insecure="false"
     local obfs=""
     local obfs_password=""
 
-    IFS='&' read -ra PARAM_ARRAY <<< "$query"
-    for param in "${PARAM_ARRAY[@]}"; do
-        local key=$(echo "$param" | cut -d= -f1)
-        local value=$(echo "$param" | cut -d= -f2-)
-        case "$key" in
-            "sni") sni="$value" ;;
-            "insecure"|"allow_insecure") insecure="1" ;;
-            "obfs") obfs="$value" ;;
-            "obfs-password") obfs_password="$value" ;;
-        esac
-    done
+    if [ -n "$params" ]; then
+        IFS='&' read -ra PARAM_ARRAY <<< "$params"
+        for param in "${PARAM_ARRAY[@]}"; do
+            local key=$(echo "$param" | cut -d= -f1)
+            local value=$(echo "$param" | cut -d= -f2-)
+            case "$key" in
+                "sni") sni="$value" ;;
+                "insecure"|"allow_insecure")
+                    [[ "$value" == "1" || -z "$value" ]] && insecure="true"
+                    ;;
+                "obfs") obfs="$value" ;;
+                "obfs-password") obfs_password="$value" ;;
+            esac
+        done
+    fi
 
     jq -c -n \
-        --arg s "$server" --arg p "$port" --arg pw "$password" \
-        --arg sni "$sni" --arg insecure "$insecure" \
+        --arg server "$server" --arg port "$port" --arg password "$password" \
+        --arg sni "$sni" --argjson insecure "$insecure" \
         --arg obfs "$obfs" --arg obfs_pw "$obfs_password" \
         '{
             type: "hysteria2",
-            server: $s,
-            server_port: ($p|tonumber),
-            password: $pw,
+            server: $server,
+            server_port: ($port|tonumber),
+            password: $password,
             tls: {
                 enabled: true,
                 server_name: $sni,
-                insecure: (if $insecure == "1" then true else false end)
+                insecure: $insecure,
+                alpn: ["h3"]
             }
         } |
         if $obfs != "" then 
@@ -444,44 +445,51 @@ _parse_hysteria2_share_link() {
 
 _parse_tuic_link() {
     local link="$1"
-    # tuic://uuid:password@server:port?sni=...&insecure=1#name
-    local uuid=$(echo "$link" | sed -n 's/tuic:\/\/\([^:]*\):.*/\1/p')
-    local password=$(echo "$link" | sed -n 's/tuic:\/\/[^:]*:\([^@]*\)@.*/\1/p')
-    local server_port=$(echo "$link" | sed -n 's/.*@\([^?#]*\).*/\1/p')
-    local server=$(echo "$server_port" | cut -d: -f1)
-    local port=$(echo "$server_port" | cut -d: -f2)
-    local query=$(echo "$link" | grep -oP '\?\K[^#]*' 2>/dev/null || echo "")
-
+    local uuid=$(echo "$link" | sed -n 's|tuic://\([^:]*\):.*|\1|p')
+    local password=$(echo "$link" | sed -n 's|tuic://[^:]*:\([^@]*\)@.*|\1|p')
+    local server_part=$(echo "$link" | sed -n 's|.*@\([^?#]*\).*|\1|p')
+    local server=$(echo "$server_part" | cut -d: -f1)
+    local port=$(echo "$server_part" | cut -d: -f2)
+    
+    local params=""
+    [[ "$link" == *"?"* ]] && params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
+    
     local sni="$server"
-    local insecure="1"
-    local alpn="h3"
+    local cc="bbr"
+    local insecure="true"
 
-    IFS='&' read -ra PARAM_ARRAY <<< "$query"
-    for param in "${PARAM_ARRAY[@]}"; do
-        local key=$(echo "$param" | cut -d= -f1)
-        local value=$(echo "$param" | cut -d= -f2-)
-        case "$key" in
-            "sni") sni="$value" ;;
-            "insecure"|"allow_insecure") insecure="1" ;;
-            "alpn") alpn="$value" ;;
-        esac
-    done
+    if [ -n "$params" ]; then
+        IFS='&' read -ra PARAM_ARRAY <<< "$params"
+        for param in "${PARAM_ARRAY[@]}"; do
+            local key=$(echo "$param" | cut -d= -f1)
+            local value=$(echo "$param" | cut -d= -f2-)
+            case "$key" in
+                "sni") sni="$value" ;;
+                "cc"|"congestion_control") cc="$value" ;;
+                "insecure"|"allow_insecure")
+                    [[ "$value" == "0" ]] && insecure="false"
+                    ;;
+            esac
+        done
+    fi
 
     jq -c -n \
-        --arg s "$server" --arg p "$port" --arg u "$uuid" \
-        --arg pw "$password" --arg sni "$sni" --arg insecure "$insecure" --arg alpn "$alpn" \
+        --arg server "$server" --arg port "$port" \
+        --arg uuid "$uuid" --arg password "$password" \
+        --arg sni "$sni" --arg cc "$cc" --argjson insecure "$insecure" \
         '{
             type: "tuic",
-            server: $s,
-            server_port: ($p|tonumber),
-            uuid: $u,
-            password: $pw,
-            congestion_control: "bbr",
+            server: $server,
+            server_port: ($port|tonumber),
+            uuid: $uuid,
+            password: $password,
+            congestion_control: $cc,
+            packet_encoding: "xudp",
             tls: {
                 enabled: true,
                 server_name: $sni,
-                alpn: [$alpn],
-                insecure: (if $insecure == "1" then true else false end)
+                insecure: $insecure,
+                alpn: ["h3"]
             }
         }'
 }
