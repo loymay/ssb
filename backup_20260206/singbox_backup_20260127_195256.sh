@@ -656,7 +656,6 @@ _add_argo_vless_ws() {
     
     echo ""
     _success "VLESS-WS + Argo 节点创建成功!"
-    _enable_argo_watchdog
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
     echo -e "接入地址: ${CYAN}${connect_address}${NC}"
@@ -854,7 +853,6 @@ _add_argo_trojan_ws() {
     
     echo ""
     _success "Trojan-WS + Argo 节点创建成功!"
-    _enable_argo_watchdog
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
     echo -e "接入地址: ${CYAN}${connect_address}${NC}"
@@ -1056,103 +1054,58 @@ _restart_argo_tunnel_menu() {
     fi
 }
 
-_argo_keepalive() {
-    # --- 性能优化: 互斥锁 ---
-    local lock_file="/tmp/singbox_keepalive.lock"
-    if [ -f "$lock_file" ]; then
-        local pid=$(cat "$lock_file")
-        if kill -0 "$pid" 2>/dev/null; then
-            # 进程仍在运行，跳过本次执行
-            return
-        fi
-    fi
-    echo "$$" > "$lock_file"
-    # 确保退出时删除锁
-    trap 'rm -f "$lock_file"' RETURN EXIT
-
-    # --- 性能优化: 日志轮转 (10MB) ---
-    local max_size=$((10 * 1024 * 1024))
-    for log in "$LOG_FILE" "$ARGO_LOG_FILE"; do
-        if [ -f "$log" ] && [ $(stat -c%s "$log" 2>/dev/null || echo 0) -ge $max_size ]; then
-            tail -n 1000 "$log" > "${log}.tmp" && mv "${log}.tmp" "$log"
-        fi
-    done
-
-    # 如果元数据文件不存在或为空，不需要守护
-    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
-        return
-    fi
-
-    # 遍历所有节点
-    local tags=$(jq -r 'keys[]' "$ARGO_METADATA_FILE")
-
-    for tag in $tags; do
-        local port=$(jq -r ".\"$tag\".local_port" "$ARGO_METADATA_FILE")
-        local type=$(jq -r ".\"$tag\".type" "$ARGO_METADATA_FILE")
-        local token=$(jq -r ".\"$tag\".token // empty" "$ARGO_METADATA_FILE")
-        
-        local pid_file="/tmp/singbox_argo_${port}.pid"
-        local is_running=false
-
-        if [ -f "$pid_file" ]; then
-            local pid=$(cat "$pid_file" 2>/dev/null)
-            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                is_running=true
-            fi
-        fi
-
-        if [ "$is_running" == "false" ]; then
-            logger "sing-box-watchdog: Detected dead tunnel for $tag (Port: $port). Restarting..."
-            if [ "$type" == "fixed" ] && [ -n "$token" ]; then
-                 _start_argo_tunnel "$port" "fixed" "$token"
-            else
-                 local new_domain=$(_start_argo_tunnel "$port" "temp")
-                 if [ -n "$new_domain" ]; then
-                      _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".domain = \"$new_domain\""
-                 fi
-            fi
-        fi
-    done
-}
-
-_enable_argo_watchdog() {
-    local job="* * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
-    if ! crontab -l 2>/dev/null | grep -Fq "$job"; then
-        _info "正在开启后台守护进程..."
-        (crontab -l 2>/dev/null; echo "$job") | crontab -
-    fi
-}
-
-_disable_argo_watchdog() {
-    local job="bash ${SELF_SCRIPT_PATH} keepalive"
-    crontab -l 2>/dev/null | grep -Fv "$job" | crontab - 2>/dev/null
-}
-
 _uninstall_argo() {
     _warning "！！！警告！！！"
     _warning "本操作将删除所有 Argo 隧道节点和 cloudflared 程序。"
     echo ""
-    
-    read -p "$(echo -e ${YELLOW}"确定要卸载 Argo 服务吗? (y/N): "${NC})" confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then return; fi
-
-    _info "正在卸载 Argo 服务..."
-    _stop_all_argo_tunnels
+    echo "即将删除的内容："
+    echo -e "  ${RED}-${NC} cloudflared 程序: ${CLOUDFLARED_BIN}"
+    echo -e "  ${RED}-${NC} Argo 日志文件: ${ARGO_LOG_FILE}"
+    echo -e "  ${RED}-${NC} Argo 元数据文件: ${ARGO_METADATA_FILE}"
     
     if [ -f "$ARGO_METADATA_FILE" ]; then
-        local tags=$(jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null)
-        for tag in $tags; do
-            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-            local node_name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE" 2>/dev/null)
-            [ -n "$node_name" ] && _remove_node_from_yaml "$node_name"
+        local argo_count=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null || echo "0")
+        echo -e "  ${RED}-${NC} Argo 节点数量: ${argo_count} 个"
+    fi
+    
+    echo ""
+    read -p "$(echo -e ${YELLOW}"确定要卸载 Argo 服务吗? (y/N): "${NC})" confirm
+    
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        _info "卸载已取消。"
+        return
+    fi
+    
+    _info "正在卸载 Argo 服务..."
+    
+    # 1. 停止隧道进程
+    _stop_argo_tunnel
+    
+    # 2. 删除 sing-box 中的 Argo inbound 配置
+    if [ -f "$ARGO_METADATA_FILE" ]; then
+        jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null | while read -r tag; do
+            if [ -n "$tag" ]; then
+                _info "正在删除节点配置: ${tag}"
+                jq "del(.inbounds[] | select(.tag == \"$tag\"))" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                
+                # [!] 同步清理主 metadata.json
+                _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")"
+                
+                # 删除 Clash 配置
+                local node_name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE" 2>/dev/null)
+                if [ -n "$node_name" ] && [ "$node_name" != "null" ]; then
+                    _remove_node_from_yaml "$node_name"
+                fi
+            fi
         done
     fi
-
-    _disable_argo_watchdog
-    pkill -f "cloudflared" 2>/dev/null
-    rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
-    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}"
+    
+    # 3. 删除 cloudflared 和相关文件
+    rm -f "${CLOUDFLARED_BIN}" "${ARGO_PID_FILE}" "${ARGO_LOG_FILE}" "${ARGO_METADATA_FILE}"
+    
+    # 4. 重启 sing-box
     _manage_service "restart"
+    
     _success "Argo 服务已完全卸载！"
     _success "已释放 cloudflared 占用的空间。"
 }
@@ -1209,30 +1162,16 @@ _argo_menu() {
 # --- 服务与配置管理 ---
 
 _create_systemd_service() {
-    # 自动计算 GOMEMLIMIT (目标 95%，但至少保留 40MB 给系统)
-    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-    local mem_limit_mb=$((total_mem_mb * 95 / 100))
-    local reserved_mb=$((total_mem_mb - mem_limit_mb))
-
-    if [ "$reserved_mb" -lt 40 ]; then
-        mem_limit_mb=$((total_mem_mb - 40))
-    fi
-
-    if [ "$mem_limit_mb" -lt 10 ]; then mem_limit_mb=10; fi # 极端情况保底
-
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
-
 [Service]
-Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
-RestartSec=3s
+RestartSec=10s
 LimitNOFILE=infinity
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -1241,41 +1180,20 @@ EOF
 _create_openrc_service() {
     # 确保日志文件存在
     touch "${LOG_FILE}"
-
-    # 自动计算 GOMEMLIMIT (目标 95%，但至少保留 40MB 给系统)
-    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-    local mem_limit_mb=$((total_mem_mb * 95 / 100))
-    local reserved_mb=$((total_mem_mb - mem_limit_mb))
-
-    if [ "$reserved_mb" -lt 40 ]; then
-        mem_limit_mb=$((total_mem_mb - 40))
-    fi
-
-    if [ "$mem_limit_mb" -lt 10 ]; then mem_limit_mb=10; fi
-
+    
     cat > "$SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
 
 description="sing-box service"
 command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
-
-# 使用 supervise-daemon 实现守护和重启
-supervisor="supervise-daemon"
-respawn_delay=3
-respawn_max=0
-
+command_background=true
 pidfile="${PID_FILE}"
-output_log="${LOG_FILE}"
-error_log="${LOG_FILE}"
+start_stop_daemon_args="--stdout ${LOG_FILE} --stderr ${LOG_FILE}"
 
 depend() {
     need net
     after firewall
-}
-
-start_pre() {
-    export GOMEMLIMIT="${mem_limit_mb}MiB"
 }
 EOF
     chmod +x "$SERVICE_FILE"
@@ -1382,65 +1300,22 @@ _uninstall() {
     if [ -f "$relay_script_path" ] || [ -d "$relay_config_dir" ]; then
         relay_detected=true
     fi
-    
-    # 检查当前目录下的进阶脚本
-    local ad_relay_script="$(dirname "$SELF_SCRIPT_PATH")/advanced_relay.sh"
-    local ad_parser_script="$(dirname "$SELF_SCRIPT_PATH")/parser.sh"
-    
-    if [ -f "$ad_relay_script" ] || [ -f "$ad_parser_script" ]; then
-         relay_detected=true
-    fi
 
     if [ "$relay_detected" = true ]; then
-        _warning "检测到 [线路机/进阶中转] 相关文件。是否一并卸载？"
-        read -p "$(echo -e ${YELLOW}"是否同时卸载线路机及中转脚本? (y/N): "${NC})" confirm_relay
+        _warning "检测到 [线路机] 脚本/配置。是否一并卸载？"
+        read -p "$(echo -e ${YELLOW}"是否同时卸载线路机服务? (y/N): "${NC})" confirm_relay
         
         if [[ "$confirm_relay" == "y" || "$confirm_relay" == "Y" ]]; then
-            _info "正在清理线路机/中转配置..."
-            
-            # 1. 旧版 relay-install.sh清理
+            _info "正在卸载 [线路机]..."
             if [ -f "$relay_script_path" ]; then
                 _info "正在执行: bash ${relay_script_path} uninstall"
                 bash "${relay_script_path}" uninstall
+                # [!] 注意：relay-install.sh 此时应该已经自删除了
+                # [!] 但为保险起见，我们还是尝试删除一下，万一它失败了
                 rm -f "$relay_script_path"
-            fi
-            
-            # 2. 新版子脚本清理
-            if [ -f "$ad_relay_script" ]; then
-                _info "删除进阶脚本: $ad_relay_script"
-                rm -f "$ad_relay_script"
-            fi
-            if [ -f "$ad_parser_script" ]; then
-                _info "删除解析脚本: $ad_parser_script"
-                rm -f "$ad_parser_script"
-            fi
-            
-            # 3. 清理残留配置
-            local relay_service_name="sing-box-relay"
-            if command -v systemctl &>/dev/null; then
-                if systemctl is-active --quiet $relay_service_name 2>/dev/null; then
-                    systemctl stop $relay_service_name
-                    systemctl disable $relay_service_name
-                fi
-                rm -f "/etc/systemd/system/${relay_service_name}.service"
-                systemctl daemon-reload
-            elif command -v rc-service &>/dev/null; then
-                if rc-service $relay_service_name status 2>/dev/null | grep -q "started"; then
-                    rc-service $relay_service_name stop
-                fi
-                rc-update del $relay_service_name default >/dev/null 2>&1
-                rm -f "/etc/init.d/${relay_service_name}"
-            fi
-            
-            if [ -d "$relay_config_dir" ]; then
-                _info "删除配置目录: $relay_config_dir"
-                rm -rf "$relay_config_dir"
-            fi
-             _success "线路机/中转配置清理完成。"
-        else
-            _info "保留了线路机/中转相关文件。"
-        fi
-    fi
+            else
+                _warning "未找到 relay-install.sh，尝试手动清理线路机配置..."
+                local relay_service_name="sing-box-relay"
                 # [!!!] BUG 修复：使用 systemctl/rc-service 等命令，而不是引用 $INIT_SYSTEM
                 if [ -d "/run/systemd/system" ] && command -v systemctl &>/dev/null; then
                     systemctl stop $relay_service_name >/dev/null 2>&1
@@ -1546,13 +1421,6 @@ _uninstall() {
 
     # 删除脚本自身 (使用启动时获取的绝对路径)
     if [ -f "$SELF_SCRIPT_PATH" ]; then
-        # 尝试删除同一目录下的 advanced_relay.sh
-        local relay_script="$(dirname "$SELF_SCRIPT_PATH")/advanced_relay.sh"
-        if [ -f "$relay_script" ]; then
-            rm -f "$relay_script"
-            _info "已删除子脚本: $relay_script"
-        fi
-        
         rm -f "$SELF_SCRIPT_PATH"
     fi
     
@@ -2232,9 +2100,15 @@ _add_anytls() {
             "listen_port": ($p|tonumber),
             "users": [{"name": "default", "password": $pw}],
             "padding_scheme": [
-                "stop=2",
-                "0=100-200",
-                "1=100-200"
+                "stop=8",
+                "0=30-30",
+                "1=100-400",
+                "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+                "3=9-9,500-1000",
+                "4=500-1000",
+                "5=500-1000",
+                "6=500-1000",
+                "7=500-1000"
             ],
             "tls": {
                 "enabled": true,
@@ -2486,10 +2360,6 @@ _add_hysteria2() {
     
     # [!] 自定义名称 (包含地区旗帜)
     local default_name="Hysteria2-${port}"
-    if [ "$is_cdn_mode" == "true" ]; then 
-        default_name="Hysteria2-CDN-443" 
-    fi
-    
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name="${server_flag}${custom_name:-$default_name}"
     
@@ -3331,7 +3201,7 @@ _import_third_party_node() {
     _info "本地适配层: ${adapter_name}"
     
     # 生成配置
-    _create_third_party_adapter "$third_party_protocol" "$third_party_config" "$adapter_type" "$adapter_method" "$local_port" "$adapter_name"
+    _create_third_party_adapter "$protocol" "$parse_result" "$adapter_type" "$adapter_method" "$local_port" "$adapter_name"
 }
 
 # 解析 VLESS 链接
@@ -3836,51 +3706,7 @@ _update_script() {
         return 1
     fi
     
-    # 更新子脚本 (advanced_relay.sh 和 parser.sh)
-    local script_dir="$(dirname "$SELF_SCRIPT_PATH")"
-    local update_base_url="$(dirname "$SCRIPT_UPDATE_URL")"
-    
-    # 定义要更新的子脚本列表
-    local sub_scripts=("advanced_relay.sh" "parser.sh")
-    
-    for sub_script in "${sub_scripts[@]}"; do
-        local local_path="${script_dir}/${sub_script}"
-        local remote_url="${update_base_url}/${sub_script}"
-        
-        # 只有当本地存在时才更新 (或者用户强行要求，这里保守策略仅更新已存在的)
-        if [ -f "$local_path" ]; then
-            _info "正在更新子脚本 (${sub_script})..."
-            if wget -qO "${local_path}.tmp" "$remote_url"; then
-                if [ -s "${local_path}.tmp" ]; then
-                    mv "${local_path}.tmp" "$local_path"
-                    chmod +x "$local_path"
-                    _success "子脚本 (${sub_script}) 更新成功！"
-                else
-                     _warning "子脚本下载为空，跳过更新。"
-                     rm -f "${local_path}.tmp"
-                fi
-            else
-                # 尝试 upstream 备用 (如果用户使用 loamy 仓库但还没传 parser.sh)
-                # 这是一个容错机制，如果主 update url 失败，尝试 0xdabiaoge 源
-                _warning "从主源更新失败，尝试从 Upstream (0xdabiaoge) 更新..."
-                local upstream_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${sub_script}"
-                if wget -qO "${local_path}.tmp" "$upstream_url"; then
-                     if [ -s "${local_path}.tmp" ]; then
-                        mv "${local_path}.tmp" "$local_path"
-                        chmod +x "$local_path"
-                        _success "子脚本 (${sub_script}) 从 Upstream 更新成功！"
-                     else
-                        rm -f "${local_path}.tmp"
-                        _error "子脚本更新彻底失败。"
-                     fi
-                else
-                     _error "子脚本更新失败，请检查网络。"
-                     rm -f "${local_path}.tmp"
-                fi
-            fi
-        fi
-    done
-
+    # 更新子脚本 (advanced_relay.sh)
     _success "脚本更新完成！"
     _info "请重新运行脚本以加载新版本："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
@@ -3908,60 +3734,6 @@ _update_singbox_core() {
     fi
 }
 
-
-# --- 进阶功能 (中转) ---
-# --- 进阶功能 (中转) ---
-_advanced_features() {
-    local script_name="advanced_relay.sh"
-    local parser_name="parser.sh"
-    
-    # 尝试在当前脚本所在目录寻找子脚本
-    local script_dir=$(dirname "$SELF_SCRIPT_PATH")
-    local local_script="${script_dir}/${script_name}"
-    local local_parser="${script_dir}/${parser_name}"
-    
-    # 如果找不到 relay 脚本，尝试从 GitHub 下载
-    if [ ! -f "$local_script" ]; then
-        _info "本地未找到 ${script_name}，正在尝试下载..."
-        
-        # 优先尝试 upstream (0xdabiaoge) 以确保获取最新版中转逻辑
-        local upstream_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${script_name}"
-        
-        if curl -s -H "Cache-Control: no-cache" -L -o "$local_script" "$upstream_url"; then
-            chmod +x "$local_script"
-            _success "下载 ${script_name} 成功！"
-        else
-            _error "下载失败，请检查网络。"
-            return
-        fi
-    fi
-    
-    # 检查并下载 parser.sh (如果 advanced_relay.sh 需要它)
-    if [ ! -f "$local_parser" ]; then
-         _info "检测到缺失 ${parser_name}，正在补充下载..."
-         local parser_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${parser_name}"
-         if curl -s -H "Cache-Control: no-cache" -L -o "$local_parser" "$parser_url"; then
-            chmod +x "$local_parser"
-            _success "下载 ${parser_name} 成功！"
-         else
-            _warn "下载 ${parser_name} 失败，中转脚本的某些解析功能可能受限。"
-         fi
-    fi
-    
-    if [ -f "$local_script" ]; then
-        # 确保有执行权限
-        chmod +x "$local_script"
-        # 运行子脚本
-        # 注意: 这里的 pwd 最好切换到脚本目录或者保证路径正确
-        # advanced_relay.sh 内部可能会寻找 ./parser.sh
-        cd "$script_dir"
-        bash "$local_script"
-        # 运行完后切回来 (虽然 exec 会替换进程，但 bash 调用不会)
-        cd - >/dev/null 2>&1
-    else
-        _error "无法执行进阶功能脚本。"
-    fi
-}
 
 _main_menu() {
     while true; do
@@ -4031,18 +3803,13 @@ _main_menu() {
         echo -e "   ${GREEN}[12]${NC} 检查配置文件     ${GREEN}[13]${NC} 更新脚本"
         echo -e "   ${GREEN}[14]${NC} 更新核心         ${RED}[15]${NC} 卸载脚本"
         echo ""
-
-        # 进阶功能
-        echo -e "  ${CYAN}【进阶功能】${NC}"
-        echo -e "   ${GREEN}[22]${NC} 节点中转"
-        echo ""
         
         
         echo -e "  ─────────────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-22]: " choice
+        read -p "  请输入选项 [0-15]: " choice
 
         case $choice in
             1) _show_add_node_menu ;;
@@ -4060,7 +3827,6 @@ _main_menu() {
             13) _update_script ;;
             14) _update_singbox_core ;;
             15) _uninstall ;; 
-            22) _advanced_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -4809,9 +4575,15 @@ _create_shortcut() {
 # --- 脚本入口 ---
 
 main() {
-    _detect_init_system
     _check_root
+    _detect_init_system
     
+    # [!!!] 最终修复：
+    # 1. 必须始终检查依赖 (yq)，因为 relay.sh 不会安装 yq
+    # 2. 检查 sing-box 程序
+    # 3. 检查配置文件
+    
+    # 1. 始终检查依赖 (特别是 yq)
     # _install_dependencies 函数内部有 "command -v" 检查，所以重复运行是安全的
     _info "正在检查核心依赖 (yq)..."
     _install_dependencies
@@ -4894,24 +4666,17 @@ main() {
     _main_menu
 }
 
-# 解析命令行参数并运行
-case "$1" in
-    "keepalive")
-        _detect_init_system
-        _argo_keepalive
-        ;;
-    *)
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                -q|--quick-deploy)
-                    QUICK_DEPLOY_MODE=true
-                    shift
-                    ;;
-                *)
-                    shift
-                    ;;
-            esac
-        done
-        main
-        ;;
-esac
+# 解析命令行参数
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -q|--quick-deploy)
+            QUICK_DEPLOY_MODE=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+main
