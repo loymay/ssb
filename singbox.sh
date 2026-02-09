@@ -1437,30 +1437,10 @@ _uninstall() {
                 rm -rf "$relay_config_dir"
             fi
              _success "线路机/中转配置清理完成。"
-        else
-            _info "保留了线路机/中转相关文件。"
-        fi
     fi
-                # [!!!] BUG 修复：使用 systemctl/rc-service 等命令，而不是引用 $INIT_SYSTEM
-                if [ -d "/run/systemd/system" ] && command -v systemctl &>/dev/null; then
-                    systemctl stop $relay_service_name >/dev/null 2>&1
-                    systemctl disable $relay_service_name >/dev/null 2>&1
-                    rm -f /etc/systemd/system/${relay_service_name}.service
-                    systemctl daemon-reload
-                elif [ -f "/sbin/openrc-run" ]; then
-                    rc-service $relay_service_name stop >/dev/null 2>&1
-                    rc-update del $relay_service_name default >/dev/null 2>&1
-                    rm -f /etc/init.d/${relay_service_name}
-                fi
-                rm -rf "$relay_config_dir"
-            fi
-            _success "[线路机] 卸载完毕。"
-            keep_singbox_binary=false 
-        else
-            _info "您选择了 [保留] 线路机服务。"
-            _warning "为了保持线路机服务 [sing-box-relay] 正常运行："
-            _success "sing-box 主程序 (${SINGBOX_BIN}) 将被 [保留]。"
-            keep_singbox_binary=true 
+
+    # [!!!] 新逻辑：增加一个保护标记，决定是否删除 sing-box 主程序
+    local keep_singbox_binary=false 
 
             echo -e "${CYAN}----------------------------------------------------${NC}"
             _success "主脚本卸载后，您仍可使用以下命令管理 [线路机]："
